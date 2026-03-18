@@ -14,6 +14,10 @@ alpha: 0.4
 max_words: 50
 label_smoothing: 0.0
 
+# Domain split: train on Gardian only; evaluate on non-Gardian.
+train_sources: ['gardian']
+val_exclude_sources: ['gardian']
+
 loss_MAC_wgt: 0.1
 loss_BIC_wgt: 1
 loss_bbox_wgt: 0.1
