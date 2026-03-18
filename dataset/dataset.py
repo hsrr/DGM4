@@ -25,6 +25,7 @@ class DGM4_Dataset(Dataset):
         self.ann = []
         for f in ann_file:
             self.ann += json.load(open(f,'r'))
+        self._apply_source_filter(config=config, is_train=is_train)
         if 'dataset_division' in config:
             self.ann = self.ann[:int(len(self.ann)/config['dataset_division'])]
 
@@ -33,6 +34,74 @@ class DGM4_Dataset(Dataset):
         self.image_res = config['image_res']
 
         self.is_train = is_train
+
+    @staticmethod
+    def _normalize_source(source):
+        if source is None:
+            return None
+        source = str(source).strip().lower().replace('-', '_').replace(' ', '_')
+        alias = {
+            'guardian': 'gardian',
+            'gardin': 'gardian',
+            'the_guardian': 'gardian',
+            'usatoday': 'usa_today',
+            'washingtonpost': 'washington_post',
+            'washingtonpost.com': 'washington_post',
+        }
+        return alias.get(source, source)
+
+    def _get_ann_source(self, ann):
+        source_keys = ('source', 'news_source', 'publisher', 'media', 'domain', 'site')
+        for key in source_keys:
+            if key in ann and ann[key]:
+                return self._normalize_source(ann[key])
+
+        image_path = ann.get('image', '')
+        path_parts = str(image_path).split('/')
+        if 'origin' in path_parts:
+            origin_idx = path_parts.index('origin')
+            if origin_idx + 1 < len(path_parts):
+                return self._normalize_source(path_parts[origin_idx + 1])
+        return None
+
+    def _apply_source_filter(self, config, is_train):
+        if is_train:
+            include_sources = config.get('train_sources', None)
+            exclude_sources = config.get('train_exclude_sources', None)
+        else:
+            include_sources = config.get('val_sources', config.get('eval_sources', None))
+            exclude_sources = config.get('val_exclude_sources', config.get('eval_exclude_sources', None))
+
+        include_sources = [self._normalize_source(s) for s in include_sources] if include_sources else []
+        exclude_sources = [self._normalize_source(s) for s in exclude_sources] if exclude_sources else []
+
+        if not include_sources and not exclude_sources:
+            return
+
+        ann_before = len(self.ann)
+        unknown_source = 0
+        filtered_ann = []
+        for ann in self.ann:
+            source = self._get_ann_source(ann)
+            if source is None:
+                unknown_source += 1
+                if include_sources:
+                    continue
+                filtered_ann.append(ann)
+                continue
+
+            if include_sources and source not in include_sources:
+                continue
+            if exclude_sources and source in exclude_sources:
+                continue
+            filtered_ann.append(ann)
+
+        self.ann = filtered_ann
+        split = 'train' if is_train else 'val/test'
+        print(
+            f"[DGM4_Dataset] source filter on {split}: {ann_before} -> {len(self.ann)} "
+            f"(unknown_source={unknown_source}, include={include_sources}, exclude={exclude_sources})"
+        )
         
     def __len__(self):
         return len(self.ann)
