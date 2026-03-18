@@ -24,7 +24,7 @@ class DGM4_Dataset(Dataset):
         self.root_dir = '../../datasets'       
         self.ann = []
         for f in ann_file:
-            self.ann += json.load(open(f,'r'))
+            self.ann += self._load_annotations(f)
         self._apply_source_filter(config=config, is_train=is_train)
         if 'dataset_division' in config:
             self.ann = self.ann[:int(len(self.ann)/config['dataset_division'])]
@@ -34,6 +34,64 @@ class DGM4_Dataset(Dataset):
         self.image_res = config['image_res']
 
         self.is_train = is_train
+
+    @staticmethod
+    def _load_annotations(path):
+        with open(path, 'r') as fp:
+            raw_text = fp.read().strip()
+
+        if not raw_text:
+            return []
+
+        # Standard JSON annotation file (list or dict).
+        try:
+            parsed = json.loads(raw_text)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                return [parsed]
+        except json.JSONDecodeError:
+            pass
+
+        # JSONL fallback: one JSON object per line.
+        line_items = []
+        is_jsonl = True
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                is_jsonl = False
+                break
+            if isinstance(obj, list):
+                line_items.extend(obj)
+            elif isinstance(obj, dict):
+                line_items.append(obj)
+
+        if is_jsonl and line_items:
+            return line_items
+
+        # Concatenated JSON fallback: multiple objects in one file without commas.
+        decoder = json.JSONDecoder()
+        idx = 0
+        concat_items = []
+        while idx < len(raw_text):
+            while idx < len(raw_text) and raw_text[idx].isspace():
+                idx += 1
+            if idx >= len(raw_text):
+                break
+            obj, idx = decoder.raw_decode(raw_text, idx)
+            if isinstance(obj, list):
+                concat_items.extend(obj)
+            elif isinstance(obj, dict):
+                concat_items.append(obj)
+
+        if concat_items:
+            return concat_items
+
+        raise ValueError(f"Unsupported annotation format in file: {path}")
 
     @staticmethod
     def _normalize_source(source):
