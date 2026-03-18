@@ -366,12 +366,27 @@ def main_worker(gpu, args, config):
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
 
-    tokenizer = BertTokenizerFast.from_pretrained(args.text_encoder)
+    try:
+        tokenizer = BertTokenizerFast.from_pretrained(
+            args.text_encoder,
+            local_files_only=args.local_files_only
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to load text encoder/tokenizer. For offline training, set --text_encoder to a local "
+            "bert-base-uncased directory and pass --local_files_only."
+        ) from e
 
     #### Model #### 
     if args.log:
         print(f"Creating MAMMER")
-    model = HAMMER(args=args, config=config, text_encoder=args.text_encoder, tokenizer=tokenizer, init_deit=True)
+    model = HAMMER(
+        args=args,
+        config=config,
+        text_encoder=args.text_encoder,
+        tokenizer=tokenizer,
+        init_deit=(not args.no_deit_init),
+    )
     model = model.to(device)   
         
     arg_opt = utils.AttrDict(config['optimizer'])
@@ -526,6 +541,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
+    parser.add_argument('--local_files_only', default=False, action='store_true')
+    parser.add_argument('--no_deit_init', default=False, action='store_true')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--seed', default=777, type=int)
     parser.add_argument('--distributed', default=True, type=bool)
