@@ -343,16 +343,34 @@ def main_worker(gpu, args, config):
     
     model = model.to(device)   
 
-    checkpoint_dir = f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
-    checkpoint = torch.load(checkpoint_dir, map_location='cpu') 
-    state_dict = checkpoint['model']                       
+    checkpoint_dir = args.checkpoint if args.checkpoint else f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
+    if not os.path.isfile(checkpoint_dir):
+        raise FileNotFoundError(
+            f"Checkpoint not found: {checkpoint_dir}. "
+            "Please pass a valid checkpoint path with --checkpoint for testing."
+        )
 
-    pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'],model.visual_encoder)   
-    state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped       
-                   
-    # model.load_state_dict(state_dict)  
+    checkpoint = torch.load(checkpoint_dir, map_location='cpu')
+    if isinstance(checkpoint, dict) and 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    elif isinstance(checkpoint, dict):
+        state_dict = checkpoint
+    else:
+        raise RuntimeError(
+            f"Unsupported checkpoint format at {checkpoint_dir}. "
+            "Expected a state_dict dict or a dict containing key 'model'."
+        )
+
+    if any(k.startswith('module.') for k in state_dict.keys()):
+        state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
+
+    if 'visual_encoder.pos_embed' in state_dict:
+        pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'], model.visual_encoder)
+        state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped
+
+    # model.load_state_dict(state_dict)
     if args.log:
-        print('load checkpoint from %s'%checkpoint_dir)  
+        print('load checkpoint from %s' % checkpoint_dir)
     msg = model.load_state_dict(state_dict, strict=False)
     if args.log:
         print(msg)  
@@ -434,7 +452,8 @@ def main_worker(gpu, args, config):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/Pretrain.yaml')
-    parser.add_argument('--checkpoint', default='') 
+    parser.add_argument('--checkpoint', default='',
+                        help='manual checkpoint path for testing; overrides output_dir/log_num/test_epoch')
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
