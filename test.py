@@ -205,11 +205,25 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     AUC_cls = roc_auc_score(y_true, y_pred)
-    pred_label = (y_pred >= 0.5).astype(np.int64)
+    cls_threshold = float(config.get('cls_threshold', 0.5))
+    pred_label = (y_pred >= cls_threshold).astype(np.int64)
     ACC_cls = (pred_label == y_true).mean()
     ERR_cls = 1.0 - ACC_cls
     fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
     EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+
+    tp = np.sum((pred_label == 1) & (y_true == 1))
+    tn = np.sum((pred_label == 0) & (y_true == 0))
+    fp = np.sum((pred_label == 1) & (y_true == 0))
+    fn = np.sum((pred_label == 0) & (y_true == 1))
+
+    Precision_cls = tp / (tp + fp + 1e-12)
+    Recall_cls = tp / (tp + fn + 1e-12)
+    F1_cls = 2*Precision_cls*Recall_cls / (Precision_cls + Recall_cls + 1e-12)
+    Specificity_cls = tn / (tn + fp + 1e-12)
+    BACC_cls = (Recall_cls + Specificity_cls) / 2
+    mcc_den = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
+    MCC_cls = ((tp * tn - fp * fn) / mcc_den) if mcc_den > 0 else 0.0
     
     ##================= bbox cls ========================##
     IOU_score = sum(IOU_pred)/len(IOU_pred)
@@ -230,7 +244,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         Recall_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
         F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
 
-    return AUC_cls, ACC_cls, ERR_cls, EER_cls, \
+    return AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
         MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok
@@ -331,7 +345,7 @@ def main_worker(gpu, args, config):
     if args.log:
         print("Start evaluation")
 
-    AUC_cls, ACC_cls, ERR_cls, EER_cls, \
+    AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
     MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
     ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
@@ -340,6 +354,12 @@ def main_worker(gpu, args, config):
                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
                     "ERR_cls": "{:.4f}".format(ERR_cls*100),
                     "EER_cls": "{:.4f}".format(EER_cls*100),
+                    "Precision_cls": "{:.4f}".format(Precision_cls*100),
+                    "Recall_cls": "{:.4f}".format(Recall_cls*100),
+                    "F1_cls": "{:.4f}".format(F1_cls*100),
+                    "MCC_cls": "{:.4f}".format(MCC_cls*100),
+                    "Specificity_cls": "{:.4f}".format(Specificity_cls*100),
+                    "BACC_cls": "{:.4f}".format(BACC_cls*100),
                     "MAP": "{:.4f}".format(MAP*100),
                     "OP": "{:.4f}".format(OP*100),
                     "OR": "{:.4f}".format(OR*100),

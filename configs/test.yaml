@@ -13,6 +13,7 @@ momentum: 0.995
 alpha: 0.4
 max_words: 50
 label_smoothing: 0.0
+cls_threshold: 0.5
 
 loss_MAC_wgt: 0.1
 loss_BIC_wgt: 1
