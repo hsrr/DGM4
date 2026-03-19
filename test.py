@@ -59,14 +59,33 @@ def resolve_checkpoint_path(args):
             os.path.join(checkpoint_path, 'pytorch_model.bin'),
             os.path.join(checkpoint_path, 'model.safetensors'),
             os.path.join(checkpoint_path, 'pytorch_model.safetensors'),
+            os.path.join(checkpoint_path, 'pytorch_model.bin.index.json'),
+            os.path.join(checkpoint_path, 'model.safetensors.index.json'),
+            os.path.join(checkpoint_path, 'pytorch_model.safetensors.index.json'),
         ):
             if os.path.isfile(candidate):
                 return candidate
+        if list(Path(checkpoint_path).glob('pytorch_model-*.bin')) or list(Path(checkpoint_path).glob('model-*.safetensors')):
+            return checkpoint_path
         raise FileNotFoundError(
             f"No model weight file found in directory: {checkpoint_path}. "
-            "Expected one of: pytorch_model.bin, model.safetensors, pytorch_model.safetensors."
+            "Expected pytorch_model.bin / model.safetensors / *.index.json / sharded model files."
         )
     if os.path.isfile(checkpoint_path):
+        file_name = os.path.basename(checkpoint_path)
+        parent_dir = os.path.dirname(checkpoint_path)
+        if file_name.endswith('.index.json'):
+            return checkpoint_path
+        if file_name.startswith('pytorch_model-') and '-of-' in file_name and file_name.endswith('.bin'):
+            index_path = os.path.join(parent_dir, 'pytorch_model.bin.index.json')
+            if os.path.isfile(index_path):
+                return index_path
+            return parent_dir
+        if file_name.startswith('model-') and '-of-' in file_name and file_name.endswith('.safetensors'):
+            index_path = os.path.join(parent_dir, 'model.safetensors.index.json')
+            if os.path.isfile(index_path):
+                return index_path
+            return parent_dir
         return checkpoint_path
     raise FileNotFoundError(
         f"Checkpoint not found: {checkpoint_path}. "
@@ -88,17 +107,69 @@ def extract_state_dict(checkpoint, checkpoint_path):
     return checkpoint
 
 
+def _load_safetensors_file(file_path):
+    try:
+        from safetensors.torch import load_file
+    except Exception as e:
+        raise RuntimeError(
+            "Checkpoint is in safetensors format, but safetensors is not available. "
+            "Install safetensors or use a .bin checkpoint."
+        ) from e
+    return load_file(file_path, device='cpu')
+
+
+def _load_weight_file(file_path):
+    if file_path.endswith('.safetensors'):
+        return _load_safetensors_file(file_path)
+    return torch.load(file_path, map_location='cpu')
+
+
+def _merge_state_dicts(state_dicts, checkpoint_path):
+    merged = {}
+    for shard in state_dicts:
+        for key, value in shard.items():
+            if key in merged:
+                raise RuntimeError(f"Duplicated parameter key '{key}' while loading sharded checkpoint: {checkpoint_path}")
+            merged[key] = value
+    return merged
+
+
+def _load_sharded_from_index(index_path):
+    with open(index_path, 'r') as f:
+        index_data = json.load(f)
+    weight_map = index_data.get('weight_map', {})
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise RuntimeError(f"Invalid sharded checkpoint index: {index_path}")
+    shard_files = list(dict.fromkeys(weight_map.values()))
+    shard_state_dicts = []
+    for shard_file in shard_files:
+        shard_path = os.path.join(os.path.dirname(index_path), shard_file)
+        if not os.path.isfile(shard_path):
+            raise FileNotFoundError(f"Missing shard file '{shard_file}' referenced by index: {index_path}")
+        shard_checkpoint = _load_weight_file(shard_path)
+        shard_state_dicts.append(extract_state_dict(shard_checkpoint, shard_path))
+    return _merge_state_dicts(shard_state_dicts, index_path)
+
+
+def _load_sharded_from_directory(checkpoint_dir):
+    bin_shards = sorted(str(p) for p in Path(checkpoint_dir).glob('pytorch_model-*.bin'))
+    safe_shards = sorted(str(p) for p in Path(checkpoint_dir).glob('model-*.safetensors'))
+    shard_files = bin_shards if bin_shards else safe_shards
+    if not shard_files:
+        raise FileNotFoundError(f"No sharded checkpoint files found in directory: {checkpoint_dir}")
+    shard_state_dicts = []
+    for shard_path in shard_files:
+        shard_checkpoint = _load_weight_file(shard_path)
+        shard_state_dicts.append(extract_state_dict(shard_checkpoint, shard_path))
+    return _merge_state_dicts(shard_state_dicts, checkpoint_dir)
+
+
 def load_checkpoint_file(checkpoint_path):
-    if checkpoint_path.endswith('.safetensors'):
-        try:
-            from safetensors.torch import load_file
-        except Exception as e:
-            raise RuntimeError(
-                "Checkpoint is in safetensors format, but safetensors is not available. "
-                "Install safetensors or use a .bin checkpoint."
-            ) from e
-        return load_file(checkpoint_path, device='cpu')
-    return torch.load(checkpoint_path, map_location='cpu')
+    if os.path.isdir(checkpoint_path):
+        return _load_sharded_from_directory(checkpoint_path)
+    if checkpoint_path.endswith('.index.json'):
+        return _load_sharded_from_index(checkpoint_path)
+    return _load_weight_file(checkpoint_path)
 
 
 def setlogger(log_file):
