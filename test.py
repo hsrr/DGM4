@@ -36,7 +36,7 @@ from tools.env import init_dist
 from tqdm import tqdm
 
 from sklearn.metrics import roc_auc_score
-from sklearn.metrics import roc_curve
+from sklearn.metrics import roc_curve, f1_score
 from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 
@@ -114,6 +114,18 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     print_freq = 200 
 
     y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
+    y_true_multicls, y_pred_multicls = [], []
+    multicls_codes = torch.tensor([
+        [0, 0, 0, 0],  # orig
+        [1, 0, 0, 0],  # face_swap
+        [0, 1, 0, 0],  # face_attribute
+        [0, 0, 1, 0],  # text_swap
+        [0, 0, 0, 1],  # text_attribute
+        [1, 0, 1, 0],  # face_swap&text_swap
+        [1, 0, 0, 1],  # face_swap&text_attribute
+        [0, 1, 1, 0],  # face_attribute&text_swap
+        [0, 1, 0, 1],  # face_attribute&text_attribute
+    ], device=device, dtype=torch.long)
 
     TP_all = 0
     TN_all = 0
@@ -150,6 +162,19 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
         multi_label_meter.add(logits_multicls, target)
+
+        # ----- multi-class metrics from multi-label logits -----
+        log_p1 = F.logsigmoid(logits_multicls).unsqueeze(1)  # [B, 1, 4]
+        log_p0 = F.logsigmoid(-logits_multicls).unsqueeze(1)  # [B, 1, 4]
+        code_float = multicls_codes.unsqueeze(0).float()  # [1, 9, 4]
+        class_logprob = (code_float * log_p1 + (1 - code_float) * log_p0).sum(-1)  # [B, 9]
+        pred_multicls = class_logprob.argmax(dim=1)
+
+        target_match = (target.unsqueeze(1) == multicls_codes.unsqueeze(0)).all(-1)
+        true_multicls = target_match.float().argmax(dim=1)
+
+        y_pred_multicls.extend(pred_multicls.cpu().tolist())
+        y_true_multicls.extend(true_multicls.cpu().tolist())
         
         for cls_idx in range(logits_multicls.shape[1]):
             cls_pred = logits_multicls[:, cls_idx]
@@ -238,6 +263,13 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     ##================= multi-label cls ========================## 
     MAP = multi_label_meter.value().mean()
     OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
+
+    ##================= multi-class cls ========================##
+    y_true_multicls = np.array(y_true_multicls, dtype=np.int64)
+    y_pred_multicls = np.array(y_pred_multicls, dtype=np.int64)
+    ACC_multicls = (y_true_multicls == y_pred_multicls).mean()
+    Macro_F1_multicls = f1_score(y_true_multicls, y_pred_multicls, average='macro', zero_division=0)
+    Weighted_F1_multicls = f1_score(y_true_multicls, y_pred_multicls, average='weighted', zero_division=0)
             
     for cls_idx in range(logits_multicls.shape[1]):
         Precision_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FP_all_multicls[cls_idx])
@@ -245,6 +277,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
 
     return AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
+        ACC_multicls, Macro_F1_multicls, Weighted_F1_multicls, \
         MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok
@@ -346,6 +379,7 @@ def main_worker(gpu, args, config):
         print("Start evaluation")
 
     AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
+    ACC_multicls, Macro_F1_multicls, Weighted_F1_multicls, \
     MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
     ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
@@ -360,6 +394,9 @@ def main_worker(gpu, args, config):
                     "MCC_cls": "{:.4f}".format(MCC_cls*100),
                     "Specificity_cls": "{:.4f}".format(Specificity_cls*100),
                     "BACC_cls": "{:.4f}".format(BACC_cls*100),
+                    "ACC_multicls": "{:.4f}".format(ACC_multicls*100),
+                    "Macro_F1_multicls": "{:.4f}".format(Macro_F1_multicls*100),
+                    "Weighted_F1_multicls": "{:.4f}".format(Weighted_F1_multicls*100),
                     "MAP": "{:.4f}".format(MAP*100),
                     "OP": "{:.4f}".format(OP*100),
                     "OR": "{:.4f}".format(OR*100),
