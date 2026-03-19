@@ -50,6 +50,57 @@ from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 
 from models.HAMMER import HAMMER
 
+
+def resolve_checkpoint_path(args):
+    checkpoint_path = args.checkpoint if args.checkpoint else f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
+    if os.path.isdir(checkpoint_path):
+        # Support HuggingFace-style save_pretrained directory.
+        for candidate in (
+            os.path.join(checkpoint_path, 'pytorch_model.bin'),
+            os.path.join(checkpoint_path, 'model.safetensors'),
+            os.path.join(checkpoint_path, 'pytorch_model.safetensors'),
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(
+            f"No model weight file found in directory: {checkpoint_path}. "
+            "Expected one of: pytorch_model.bin, model.safetensors, pytorch_model.safetensors."
+        )
+    if os.path.isfile(checkpoint_path):
+        return checkpoint_path
+    raise FileNotFoundError(
+        f"Checkpoint not found: {checkpoint_path}. "
+        "Please pass a valid checkpoint file or save_pretrained directory via --checkpoint."
+    )
+
+
+def extract_state_dict(checkpoint, checkpoint_path):
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError(
+            f"Unsupported checkpoint format at {checkpoint_path}. "
+            "Expected a dict-compatible checkpoint."
+        )
+    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
+        return checkpoint['model']
+    if 'state_dict' in checkpoint and isinstance(checkpoint['state_dict'], dict):
+        return checkpoint['state_dict']
+    # save_pretrained often stores a plain state_dict directly.
+    return checkpoint
+
+
+def load_checkpoint_file(checkpoint_path):
+    if checkpoint_path.endswith('.safetensors'):
+        try:
+            from safetensors.torch import load_file
+        except Exception as e:
+            raise RuntimeError(
+                "Checkpoint is in safetensors format, but safetensors is not available. "
+                "Install safetensors or use a .bin checkpoint."
+            ) from e
+        return load_file(checkpoint_path, device='cpu')
+    return torch.load(checkpoint_path, map_location='cpu')
+
+
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
     streamhandler = logging.StreamHandler()
@@ -343,23 +394,9 @@ def main_worker(gpu, args, config):
     
     model = model.to(device)   
 
-    checkpoint_dir = args.checkpoint if args.checkpoint else f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
-    if not os.path.isfile(checkpoint_dir):
-        raise FileNotFoundError(
-            f"Checkpoint not found: {checkpoint_dir}. "
-            "Please pass a valid checkpoint path with --checkpoint for testing."
-        )
-
-    checkpoint = torch.load(checkpoint_dir, map_location='cpu')
-    if isinstance(checkpoint, dict) and 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    elif isinstance(checkpoint, dict):
-        state_dict = checkpoint
-    else:
-        raise RuntimeError(
-            f"Unsupported checkpoint format at {checkpoint_dir}. "
-            "Expected a state_dict dict or a dict containing key 'model'."
-        )
+    checkpoint_dir = resolve_checkpoint_path(args)
+    checkpoint = load_checkpoint_file(checkpoint_dir)
+    state_dict = extract_state_dict(checkpoint, checkpoint_dir)
 
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
@@ -453,7 +490,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='./configs/Pretrain.yaml')
     parser.add_argument('--checkpoint', default='',
-                        help='manual checkpoint path for testing; overrides output_dir/log_num/test_epoch')
+                        help='manual checkpoint file OR save_pretrained directory for testing; overrides output_dir/log_num/test_epoch')
     parser.add_argument('--resume', default=False, type=bool)
     parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
     parser.add_argument('--text_encoder', default='bert-base-uncased')
