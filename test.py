@@ -12,6 +12,7 @@ import time
 import datetime
 import json
 from pathlib import Path
+import sys
 
 import torch
 import torch.nn as nn
@@ -19,6 +20,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+
+# Ensure local project modules are importable regardless of launch directory.
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.vit import interpolate_pos_embed
 from transformers import BertTokenizerFast
