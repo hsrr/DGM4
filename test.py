@@ -54,22 +54,57 @@ from models.HAMMER import HAMMER
 def resolve_checkpoint_path(args):
     checkpoint_path = args.checkpoint if args.checkpoint else f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
     if os.path.isdir(checkpoint_path):
-        # Support HuggingFace-style save_pretrained directory.
+        root = Path(checkpoint_path)
+
+        # 1) Prefer direct files in the provided directory.
         for candidate in (
-            os.path.join(checkpoint_path, 'pytorch_model.bin'),
-            os.path.join(checkpoint_path, 'model.safetensors'),
-            os.path.join(checkpoint_path, 'pytorch_model.safetensors'),
-            os.path.join(checkpoint_path, 'pytorch_model.bin.index.json'),
-            os.path.join(checkpoint_path, 'model.safetensors.index.json'),
-            os.path.join(checkpoint_path, 'pytorch_model.safetensors.index.json'),
+            root / 'pytorch_model.bin',
+            root / 'model.safetensors',
+            root / 'pytorch_model.safetensors',
+            root / 'pytorch_model.bin.index.json',
+            root / 'model.safetensors.index.json',
+            root / 'pytorch_model.safetensors.index.json',
         ):
-            if os.path.isfile(candidate):
-                return candidate
-        if list(Path(checkpoint_path).glob('pytorch_model-*.bin')) or list(Path(checkpoint_path).glob('model-*.safetensors')):
-            return checkpoint_path
+            if candidate.is_file():
+                return str(candidate)
+        if list(root.glob('pytorch_model-*.bin')) or list(root.glob('model-*.safetensors')):
+            return str(root)
+
+        # 2) Fallback: recursively discover nested save_pretrained outputs.
+        recursive_candidates = []
+        patterns = (
+            '**/pytorch_model.bin.index.json',
+            '**/model.safetensors.index.json',
+            '**/pytorch_model.safetensors.index.json',
+            '**/pytorch_model.bin',
+            '**/model.safetensors',
+        )
+        for pattern in patterns:
+            recursive_candidates.extend(root.glob(pattern))
+
+        # Add shard-only directories (without index files) as directory-level candidates.
+        shard_dirs = set()
+        for shard in root.glob('**/pytorch_model-*.bin'):
+            shard_dirs.add(str(shard.parent))
+        for shard in root.glob('**/model-*.safetensors'):
+            shard_dirs.add(str(shard.parent))
+        recursive_candidates.extend(Path(p) for p in shard_dirs)
+
+        if recursive_candidates:
+            # Heuristic: prefer "best_model" paths; then shallower depth; then lexicographic.
+            def _candidate_key(p):
+                p_str = str(p)
+                best_model_rank = 0 if '/best_model/' in p_str or p_str.endswith('/best_model') else 1
+                depth = len(p.parts)
+                return (best_model_rank, depth, p_str)
+
+            selected = sorted(recursive_candidates, key=_candidate_key)[0]
+            return str(selected)
+
         raise FileNotFoundError(
             f"No model weight file found in directory: {checkpoint_path}. "
-            "Expected pytorch_model.bin / model.safetensors / *.index.json / sharded model files."
+            "Expected pytorch_model.bin / model.safetensors / *.index.json / sharded model files "
+            "either directly under this directory or in its subdirectories."
         )
     if os.path.isfile(checkpoint_path):
         file_name = os.path.basename(checkpoint_path)
