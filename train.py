@@ -201,8 +201,6 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     print_freq = 200 
 
     y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
-    cls_nums_all = 0
-    cls_acc_all = 0   
     
     TP_all = 0
     TN_all = 0
@@ -229,10 +227,6 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
 
         y_pred.extend(F.softmax(logits_real_fake,dim=1)[:,1].cpu().flatten().tolist())
         y_true.extend(cls_label.cpu().flatten().tolist())
-
-        pred_acc = logits_real_fake.argmax(1)
-        cls_nums_all += cls_label.shape[0]
-        cls_acc_all += torch.sum(pred_acc == cls_label).item()
 
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
@@ -282,7 +276,9 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     AUC_cls = roc_auc_score(y_true, y_pred)
-    ACC_cls = cls_acc_all / cls_nums_all
+    pred_label = (y_pred >= 0.5).astype(np.int64)
+    ACC_cls = (pred_label == y_true).mean()
+    ERR_cls = 1.0 - ACC_cls
     fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
     EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
     
@@ -303,7 +299,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     Recall_tok = TP_all / (TP_all + FN_all)
     F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
 
-    return AUC_cls, ACC_cls, EER_cls, \
+    return AUC_cls, ACC_cls, ERR_cls, EER_cls, \
            MAP.item(), OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
            IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
            ACC_tok, Precision_tok, Recall_tok, F1_tok
@@ -425,7 +421,7 @@ def main_worker(gpu, args, config):
     for epoch in range(start_epoch, max_epoch):
             
         train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
-        AUC_cls, ACC_cls, EER_cls, \
+        AUC_cls, ACC_cls, ERR_cls, EER_cls, \
         MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok \
@@ -436,6 +432,7 @@ def main_worker(gpu, args, config):
             lossinfo = {
                 'AUC_cls': round(AUC_cls*100, 4),                                                                                                  
                 'ACC_cls': round(ACC_cls*100, 4),                                                                                                  
+                'ERR_cls': round(ERR_cls*100, 4),                                                                                                  
                 'EER_cls': round(EER_cls*100, 4),                                                                                                  
                 'MAP': round(MAP*100, 4),                                                                                                  
                 'OP': round(OP*100, 4),                                                                                                  
@@ -465,6 +462,7 @@ def main_worker(gpu, args, config):
         #============ evaluation info ============#
         val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                      "ACC_cls": "{:.4f}".format(ACC_cls*100),
+                     "ERR_cls": "{:.4f}".format(ERR_cls*100),
                      "EER_cls": "{:.4f}".format(EER_cls*100),
                      "MAP": "{:.4f}".format(MAP*100),
                      "OP": "{:.4f}".format(OP*100),

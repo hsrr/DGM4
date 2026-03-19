@@ -114,8 +114,6 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     print_freq = 200 
 
     y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
-    cls_nums_all = 0
-    cls_acc_all = 0   
 
     TP_all = 0
     TN_all = 0
@@ -148,10 +146,6 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
 
         y_pred.extend(F.softmax(logits_real_fake,dim=1)[:,1].cpu().flatten().tolist())
         y_true.extend(cls_label.cpu().flatten().tolist())
-
-        pred_acc = logits_real_fake.argmax(1)
-        cls_nums_all += cls_label.shape[0]
-        cls_acc_all += torch.sum(pred_acc == cls_label).item()
 
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
@@ -211,7 +205,9 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
     AUC_cls = roc_auc_score(y_true, y_pred)
-    ACC_cls = cls_acc_all / cls_nums_all
+    pred_label = (y_pred >= 0.5).astype(np.int64)
+    ACC_cls = (pred_label == y_true).mean()
+    ERR_cls = 1.0 - ACC_cls
     fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
     EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
     
@@ -234,7 +230,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         Recall_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
         F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
 
-    return AUC_cls, ACC_cls, EER_cls, \
+    return AUC_cls, ACC_cls, ERR_cls, EER_cls, \
         MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \
         IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
         ACC_tok, Precision_tok, Recall_tok, F1_tok
@@ -335,13 +331,14 @@ def main_worker(gpu, args, config):
     if args.log:
         print("Start evaluation")
 
-    AUC_cls, ACC_cls, EER_cls, \
+    AUC_cls, ACC_cls, ERR_cls, EER_cls, \
     MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
     IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
     ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
     #============ evaluation info ============#
     val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                     "ACC_cls": "{:.4f}".format(ACC_cls*100),
+                    "ERR_cls": "{:.4f}".format(ERR_cls*100),
                     "EER_cls": "{:.4f}".format(EER_cls*100),
                     "MAP": "{:.4f}".format(MAP*100),
                     "OP": "{:.4f}".format(OP*100),
