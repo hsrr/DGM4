@@ -1,629 +1,235 @@
+import os
+import re
+import argparse
+import numpy as np
+from tqdm import tqdm
 import warnings
+import torch
+from torch.utils.data import DataLoader
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, roc_curve
+from transformers import AutoModelForCausalLM, AutoProcessor
+
+# === 导入 Dataset ===
+from dgm4Datasets5class import DGM4_Dataset 
+
 warnings.filterwarnings("ignore")
 
-import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# ==========================================
+#             工具函数 (来自你的 train.py)
+# ==========================================
 
-import argparse
-import ruamel_yaml as yaml
-import numpy as np
-import random
-import time
-import datetime
-import json
-from pathlib import Path
-import sys
+def parse_prediction_vector(pred_str):
+    text = str(pred_str).upper().strip()
+    vec = [0, 0, 0, 0]  # [B, C, D, E]
+    
+    # 先检查是否为纯 A（真实）
+    if re.fullmatch(r'\s*A\s*', text):
+        return vec  # 全0 = 真实
+    
+    # 严格匹配：字母必须独立（前后非字母数字）
+    if re.search(r'(?<![A-Z])B(?![A-Z])', text): vec[0] = 1
+    if re.search(r'(?<![A-Z])C(?![A-Z])', text): vec[1] = 1
+    if re.search(r'(?<![A-Z])D(?![A-Z])', text): vec[2] = 1
+    if re.search(r'(?<![A-Z])E(?![A-Z])', text): vec[3] = 1
+    
+    # 额外安全：若检测到 A 且无其他字母 → 强制设为真实
+    if 'A' in text and sum(vec) == 0:
+        return [0, 0, 0, 0]
+    
+    return vec
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+def _resolve_letter_token_ids(tokenizer, letter):
+    candidate_ids = []
+    for candidate in (letter, f" {letter}", letter.lower(), f" {letter.lower()}"):
+        token_ids = tokenizer.encode(candidate, add_special_tokens=False)
+        if len(token_ids) == 1:
+            candidate_ids.append(token_ids[0])
+    if len(candidate_ids) == 0:
+        candidate_ids = [tokenizer.encode(letter, add_special_tokens=False)[0]]
+    return sorted(set(candidate_ids))
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
+def calculate_eer(y_true, y_scores):
+    fpr, tpr, _ = roc_curve(y_true, y_scores, pos_label=1)
+    fnr = 1 - tpr
+    idx = np.nanargmin(np.absolute(fnr - fpr))
+    return float((fpr[idx] + fnr[idx]) / 2.0)
 
-from models.vit import interpolate_pos_embed
-from transformers import BertTokenizerFast
+def _extract_fake_prob_from_outputs(outputs, letter_token_ids):
+    num_steps = len(outputs.scores)
+    bsz = outputs.sequences.size(0)
+    seq_steps = outputs.sequences[:, 1:1 + num_steps]
 
-import utils
-from dataset import create_dataset, create_sampler, create_loader
-from scheduler import create_scheduler
-from optim import create_optimizer
+    letter_union = set()
+    for key in ["A", "B", "C", "D", "E"]:
+        letter_union.update(letter_token_ids[key])
 
-import torch.multiprocessing as mp
-from torch.utils.tensorboard import SummaryWriter
-import logging
-from types import MethodType
-from tools.env import init_dist
-from tqdm import tqdm
+    fake_probs = []
+    for i in range(bsz):
+        step_idx = None
+        for t in range(num_steps):
+            tok_id = int(seq_steps[i, t].item())
+            if tok_id in letter_union:
+                step_idx = t
+                break
+        if step_idx is None:
+            step_idx = 0
 
-from sklearn.metrics import roc_auc_score
-from sklearn.metrics import roc_curve, f1_score
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-
-from models import box_ops
-from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
-
-from models.HAMMER import HAMMER
-
-
-def resolve_checkpoint_path(args):
-    checkpoint_path = args.checkpoint if args.checkpoint else f'{args.output_dir}/{args.log_num}/checkpoint_{args.test_epoch}.pth'
-    if os.path.isdir(checkpoint_path):
-        root = Path(checkpoint_path)
-
-        # 1) Prefer direct files in the provided directory.
-        for candidate in (
-            root / 'pytorch_model.bin',
-            root / 'model.safetensors',
-            root / 'pytorch_model.safetensors',
-            root / 'pytorch_model.bin.index.json',
-            root / 'model.safetensors.index.json',
-            root / 'pytorch_model.safetensors.index.json',
-        ):
-            if candidate.is_file():
-                return str(candidate)
-        if list(root.glob('pytorch_model-*.bin')) or list(root.glob('model-*.safetensors')):
-            return str(root)
-
-        # 2) Fallback: recursively discover nested save_pretrained outputs.
-        recursive_candidates = []
-        patterns = (
-            '**/pytorch_model.bin.index.json',
-            '**/model.safetensors.index.json',
-            '**/pytorch_model.safetensors.index.json',
-            '**/pytorch_model.bin',
-            '**/model.safetensors',
-        )
-        for pattern in patterns:
-            recursive_candidates.extend(root.glob(pattern))
-
-        # Add shard-only directories (without index files) as directory-level candidates.
-        shard_dirs = set()
-        for shard in root.glob('**/pytorch_model-*.bin'):
-            shard_dirs.add(str(shard.parent))
-        for shard in root.glob('**/model-*.safetensors'):
-            shard_dirs.add(str(shard.parent))
-        recursive_candidates.extend(Path(p) for p in shard_dirs)
-
-        if recursive_candidates:
-            # Heuristic: prefer "best_model" paths; then shallower depth; then lexicographic.
-            def _candidate_key(p):
-                p_str = str(p)
-                best_model_rank = 0 if '/best_model/' in p_str or p_str.endswith('/best_model') else 1
-                depth = len(p.parts)
-                return (best_model_rank, depth, p_str)
-
-            selected = sorted(recursive_candidates, key=_candidate_key)[0]
-            return str(selected)
-
-        raise FileNotFoundError(
-            f"No model weight file found in directory: {checkpoint_path}. "
-            "Expected pytorch_model.bin / model.safetensors / *.index.json / sharded model files "
-            "either directly under this directory or in its subdirectories."
-        )
-    if os.path.isfile(checkpoint_path):
-        file_name = os.path.basename(checkpoint_path)
-        parent_dir = os.path.dirname(checkpoint_path)
-        if file_name.endswith('.index.json'):
-            return checkpoint_path
-        if file_name.startswith('pytorch_model-') and '-of-' in file_name and file_name.endswith('.bin'):
-            index_path = os.path.join(parent_dir, 'pytorch_model.bin.index.json')
-            if os.path.isfile(index_path):
-                return index_path
-            return parent_dir
-        if file_name.startswith('model-') and '-of-' in file_name and file_name.endswith('.safetensors'):
-            index_path = os.path.join(parent_dir, 'model.safetensors.index.json')
-            if os.path.isfile(index_path):
-                return index_path
-            return parent_dir
-        return checkpoint_path
-    raise FileNotFoundError(
-        f"Checkpoint not found: {checkpoint_path}. "
-        "Please pass a valid checkpoint file or save_pretrained directory via --checkpoint."
-    )
-
-
-def extract_state_dict(checkpoint, checkpoint_path):
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(
-            f"Unsupported checkpoint format at {checkpoint_path}. "
-            "Expected a dict-compatible checkpoint."
-        )
-    if 'model' in checkpoint and isinstance(checkpoint['model'], dict):
-        return checkpoint['model']
-    if 'state_dict' in checkpoint and isinstance(checkpoint['state_dict'], dict):
-        return checkpoint['state_dict']
-    # save_pretrained often stores a plain state_dict directly.
-    return checkpoint
-
-
-def _load_safetensors_file(file_path):
-    try:
-        from safetensors.torch import load_file
-    except Exception as e:
-        raise RuntimeError(
-            "Checkpoint is in safetensors format, but safetensors is not available. "
-            "Install safetensors or use a .bin checkpoint."
-        ) from e
-    return load_file(file_path, device='cpu')
-
-
-def _load_weight_file(file_path):
-    if file_path.endswith('.safetensors'):
-        return _load_safetensors_file(file_path)
-    return torch.load(file_path, map_location='cpu')
-
-
-def _merge_state_dicts(state_dicts, checkpoint_path):
-    merged = {}
-    for shard in state_dicts:
-        for key, value in shard.items():
-            if key in merged:
-                raise RuntimeError(f"Duplicated parameter key '{key}' while loading sharded checkpoint: {checkpoint_path}")
-            merged[key] = value
-    return merged
-
-
-def _load_sharded_from_index(index_path):
-    with open(index_path, 'r') as f:
-        index_data = json.load(f)
-    weight_map = index_data.get('weight_map', {})
-    if not isinstance(weight_map, dict) or not weight_map:
-        raise RuntimeError(f"Invalid sharded checkpoint index: {index_path}")
-    shard_files = list(dict.fromkeys(weight_map.values()))
-    shard_state_dicts = []
-    for shard_file in shard_files:
-        shard_path = os.path.join(os.path.dirname(index_path), shard_file)
-        if not os.path.isfile(shard_path):
-            raise FileNotFoundError(f"Missing shard file '{shard_file}' referenced by index: {index_path}")
-        shard_checkpoint = _load_weight_file(shard_path)
-        shard_state_dicts.append(extract_state_dict(shard_checkpoint, shard_path))
-    return _merge_state_dicts(shard_state_dicts, index_path)
-
-
-def _load_sharded_from_directory(checkpoint_dir):
-    bin_shards = sorted(str(p) for p in Path(checkpoint_dir).glob('pytorch_model-*.bin'))
-    safe_shards = sorted(str(p) for p in Path(checkpoint_dir).glob('model-*.safetensors'))
-    shard_files = bin_shards if bin_shards else safe_shards
-    if not shard_files:
-        raise FileNotFoundError(f"No sharded checkpoint files found in directory: {checkpoint_dir}")
-    shard_state_dicts = []
-    for shard_path in shard_files:
-        shard_checkpoint = _load_weight_file(shard_path)
-        shard_state_dicts.append(extract_state_dict(shard_checkpoint, shard_path))
-    return _merge_state_dicts(shard_state_dicts, checkpoint_dir)
-
-
-def load_checkpoint_file(checkpoint_path):
-    if os.path.isdir(checkpoint_path):
-        return _load_sharded_from_directory(checkpoint_path)
-    if checkpoint_path.endswith('.index.json'):
-        return _load_sharded_from_index(checkpoint_path)
-    return _load_weight_file(checkpoint_path)
-
-
-def setlogger(log_file):
-    filehandler = logging.FileHandler(log_file)
-    streamhandler = logging.StreamHandler()
-
-    logger = logging.getLogger('')
-    logger.setLevel(logging.INFO)
-    logger.addHandler(filehandler)
-    logger.addHandler(streamhandler)
-
-    def epochInfo(self, set, idx, loss, acc):
-        self.info('{set}-{idx:d} epoch | loss:{loss:.8f} | auc:{acc:.4f}%'.format(
-            set=set,
-            idx=idx,
-            loss=loss,
-            acc=acc
-        ))
-
-    logger.epochInfo = MethodType(epochInfo, logger)
-
-    return logger
-
-
-def text_input_adjust(text_input, fake_word_pos, device):
-    # input_ids adaptation
-    input_ids_remove_SEP = [x[:-1] for x in text_input.input_ids]
-    maxlen = max([len(x) for x in text_input.input_ids])-1
-    input_ids_remove_SEP_pad = [x + [0] * (maxlen - len(x)) for x in input_ids_remove_SEP] # only remove SEP as HAMMER is conducted with text with CLS
-    text_input.input_ids = torch.LongTensor(input_ids_remove_SEP_pad).to(device) 
-
-    # attention_mask adaptation
-    attention_mask_remove_SEP = [x[:-1] for x in text_input.attention_mask]
-    attention_mask_remove_SEP_pad = [x + [0] * (maxlen - len(x)) for x in attention_mask_remove_SEP]
-    text_input.attention_mask = torch.LongTensor(attention_mask_remove_SEP_pad).to(device)
-
-    # fake_token_pos adaptation
-    fake_token_pos_batch = []
-    subword_idx_rm_CLSSEP_batch = []
-    for i in range(len(fake_word_pos)):
-        fake_token_pos = []
-
-        fake_word_pos_decimal = np.where(fake_word_pos[i].numpy() == 1)[0].tolist() # transfer fake_word_pos into numbers
-
-        subword_idx = text_input.word_ids(i)
-        subword_idx_rm_CLSSEP = subword_idx[1:-1]
-        subword_idx_rm_CLSSEP_array = np.array(subword_idx_rm_CLSSEP) # get the sub-word position (token position)
+        step_probs = torch.softmax(outputs.scores[step_idx][i], dim=-1)
+        p_a = step_probs[letter_token_ids["A"]].sum()
+        p_b = step_probs[letter_token_ids["B"]].sum()
+        p_c = step_probs[letter_token_ids["C"]].sum()
+        p_d = step_probs[letter_token_ids["D"]].sum()
+        p_e = step_probs[letter_token_ids["E"]].sum()
+        denom = p_a + p_b + p_c + p_d + p_e
         
-        subword_idx_rm_CLSSEP_batch.append(subword_idx_rm_CLSSEP_array)
-        
-        # transfer the fake word position into fake token position
-        for i in fake_word_pos_decimal: 
-            fake_token_pos.extend(np.where(subword_idx_rm_CLSSEP_array == i)[0].tolist())
-        fake_token_pos_batch.append(fake_token_pos)
+        if float(denom.item()) <= 1e-12:
+            fake_probs.append(0.5)
+        else:
+            # Fake的概率 = 1 - P(A)
+            fake_probs.append(float((1.0 - (p_a / denom)).item()))
 
-    return text_input, fake_token_pos_batch, subword_idx_rm_CLSSEP_batch
+    return np.array(fake_probs, dtype=np.float32)
 
-  
+# ==========================================
+#             主测试流程
+# ==========================================
 
-@torch.no_grad()
-def evaluation(args, model, data_loader, tokenizer, device, config):
-    # test
-    model.eval() 
+def evaluate(args):
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print(f"[*] 使用设备: {device}")
     
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    header = 'Evaluation:'    
-    
-    print('Computing features for evaluation...')
-    print_freq = 200 
+    # 1. 自动处理分片并加载模型
+    print(f"[*] 正在加载模型和处理器: {args.checkpoint}")
+    # HuggingFace 的 from_pretrained 能够自动识别目录下的 .index.json 和分片的 .bin / .safetensors
+    processor = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(args.checkpoint, trust_remote_code=True).to(device)
+    model.eval()
 
-    y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
-    y_true_multicls, y_pred_multicls = [], []
-    multicls_codes = torch.tensor([
-        [0, 0, 0, 0],  # orig
-        [1, 0, 0, 0],  # face_swap
-        [0, 1, 0, 0],  # face_attribute
-        [0, 0, 1, 0],  # text_swap
-        [0, 0, 0, 1],  # text_attribute
-        [1, 0, 1, 0],  # face_swap&text_swap
-        [1, 0, 0, 1],  # face_swap&text_attribute
-        [0, 1, 1, 0],  # face_attribute&text_swap
-        [0, 1, 0, 1],  # face_attribute&text_attribute
-    ], device=device, dtype=torch.long)
-
-    TP_all = 0
-    TN_all = 0
-    FP_all = 0
-    FN_all = 0
-    
-    TP_all_multicls = np.zeros(4, dtype = int)
-    TN_all_multicls = np.zeros(4, dtype = int)
-    FP_all_multicls = np.zeros(4, dtype = int)
-    FN_all_multicls = np.zeros(4, dtype = int)
-    F1_multicls = np.zeros(4)
-
-    multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
-    multi_label_meter.reset()
-
-    for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
-        
-        image = image.to(device,non_blocking=True) 
-        
-        text_input = tokenizer(text, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False) 
-        
-        text_input, fake_token_pos, _ = text_input_adjust(text_input, fake_word_pos, device)
-
-        logits_real_fake, logits_multicls, output_coord, logits_tok = model(image, label, text_input, fake_image_box, fake_token_pos, is_train=False)
-
-        ##================= real/fake cls ========================## 
-        cls_label = torch.ones(len(label), dtype=torch.long).to(image.device) 
-        real_label_pos = np.where(np.array(label) == 'orig')[0].tolist()
-        cls_label[real_label_pos] = 0
-
-        y_pred.extend(F.softmax(logits_real_fake,dim=1)[:,1].cpu().flatten().tolist())
-        y_true.extend(cls_label.cpu().flatten().tolist())
-
-        # ----- multi metrics -----
-        target, _ = get_multi_label(label, image)
-        multi_label_meter.add(logits_multicls, target)
-
-        # ----- multi-class metrics from multi-label logits -----
-        log_p1 = F.logsigmoid(logits_multicls).unsqueeze(1)  # [B, 1, 4]
-        log_p0 = F.logsigmoid(-logits_multicls).unsqueeze(1)  # [B, 1, 4]
-        code_float = multicls_codes.unsqueeze(0).float()  # [1, 9, 4]
-        class_logprob = (code_float * log_p1 + (1 - code_float) * log_p0).sum(-1)  # [B, 9]
-        pred_multicls = class_logprob.argmax(dim=1)
-
-        target_match = (target.unsqueeze(1) == multicls_codes.unsqueeze(0)).all(-1)
-        true_multicls = target_match.float().argmax(dim=1)
-
-        y_pred_multicls.extend(pred_multicls.cpu().tolist())
-        y_true_multicls.extend(true_multicls.cpu().tolist())
-        
-        for cls_idx in range(logits_multicls.shape[1]):
-            cls_pred = logits_multicls[:, cls_idx]
-            cls_pred[cls_pred>=0]=1
-            cls_pred[cls_pred<0]=0
-            
-            TP_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 1) * (cls_pred == 1)).item()
-            TN_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 0) * (cls_pred == 0)).item()
-            FP_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 0) * (cls_pred == 1)).item()
-            FN_all_multicls[cls_idx] += torch.sum((target[:, cls_idx] == 1) * (cls_pred == 0)).item()
-            
-        ##================= bbox cls ========================## 
-        boxes1 = box_ops.box_cxcywh_to_xyxy(output_coord)
-        boxes2 = box_ops.box_cxcywh_to_xyxy(fake_image_box)
-
-        IOU, _ = box_ops.box_iou(boxes1, boxes2.to(device), test=True)
-
-        IOU_pred.extend(IOU.cpu().tolist())
-
-        IOU_50_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_75_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_95_bt = torch.zeros(IOU.shape, dtype=torch.long)
-
-        IOU_50_bt[IOU>0.5] = 1
-        IOU_75_bt[IOU>0.75] = 1
-        IOU_95_bt[IOU>0.95] = 1
-
-        IOU_50.extend(IOU_50_bt.cpu().tolist())
-        IOU_75.extend(IOU_75_bt.cpu().tolist())
-        IOU_95.extend(IOU_95_bt.cpu().tolist())
-
-        ##================= token cls ========================##  
-        token_label = text_input.attention_mask[:,1:].clone() # [:,1:] for ingoring class token
-        token_label[token_label==0] = -100 # -100 index = padding token
-        token_label[token_label==1] = 0
-
-        for batch_idx in range(len(fake_token_pos)):
-            fake_pos_sample = fake_token_pos[batch_idx]
-            if fake_pos_sample:
-                for pos in fake_pos_sample:
-                    token_label[batch_idx, pos] = 1
-                    
-        logits_tok_reshape = logits_tok.view(-1, 2)
-        logits_tok_pred = logits_tok_reshape.argmax(1)
-        token_label_reshape = token_label.view(-1)
-
-        # F1
-        TP_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 1)).item()
-        TN_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 0)).item()
-        FP_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
-        FN_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
-                 
-    ##================= real/fake cls ========================## 
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    AUC_cls = roc_auc_score(y_true, y_pred)
-    cls_threshold = float(config.get('cls_threshold', 0.5))
-    pred_label = (y_pred >= cls_threshold).astype(np.int64)
-    ACC_cls = (pred_label == y_true).mean()
-    ERR_cls = 1.0 - ACC_cls
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
-    EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
-
-    tp = np.sum((pred_label == 1) & (y_true == 1))
-    tn = np.sum((pred_label == 0) & (y_true == 0))
-    fp = np.sum((pred_label == 1) & (y_true == 0))
-    fn = np.sum((pred_label == 0) & (y_true == 1))
-
-    Precision_cls = tp / (tp + fp + 1e-12)
-    Recall_cls = tp / (tp + fn + 1e-12)
-    F1_cls = 2*Precision_cls*Recall_cls / (Precision_cls + Recall_cls + 1e-12)
-    Specificity_cls = tn / (tn + fp + 1e-12)
-    BACC_cls = (Recall_cls + Specificity_cls) / 2
-    mcc_den = np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-    MCC_cls = ((tp * tn - fp * fn) / mcc_den) if mcc_den > 0 else 0.0
-    
-    ##================= bbox cls ========================##
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    IOU_ACC_50 = sum(IOU_50)/len(IOU_50)
-    IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
-    IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
-    # ##================= token cls========================##
-    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
-    Precision_tok = TP_all / (TP_all + FP_all)
-    Recall_tok = TP_all / (TP_all + FN_all)
-    F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
-    ##================= multi-label cls ========================## 
-    MAP = multi_label_meter.value().mean()
-    OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
-
-    ##================= multi-class cls ========================##
-    y_true_multicls = np.array(y_true_multicls, dtype=np.int64)
-    y_pred_multicls = np.array(y_pred_multicls, dtype=np.int64)
-    ACC_multicls = (y_true_multicls == y_pred_multicls).mean()
-    Macro_F1_multicls = f1_score(y_true_multicls, y_pred_multicls, average='macro', zero_division=0)
-    Weighted_F1_multicls = f1_score(y_true_multicls, y_pred_multicls, average='weighted', zero_division=0)
-            
-    for cls_idx in range(logits_multicls.shape[1]):
-        Precision_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FP_all_multicls[cls_idx])
-        Recall_multicls = TP_all_multicls[cls_idx] / (TP_all_multicls[cls_idx] + FN_all_multicls[cls_idx])
-        F1_multicls[cls_idx] = 2*Precision_multicls*Recall_multicls / (Precision_multicls + Recall_multicls)            
-
-    return AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
-        ACC_multicls, Macro_F1_multicls, Weighted_F1_multicls, \
-        MAP.item(), OP, OR, OF1, CP, CR, CF1, F1_multicls, \
-        IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-        ACC_tok, Precision_tok, Recall_tok, F1_tok
-    
-def main_worker(gpu, args, config):
-
-    if gpu is not None:
-        args.gpu = gpu
-
-    init_dist(args)
-
-    eval_type = os.path.basename(config['val_file'][0]).split('.')[0]
-    if eval_type == 'test':
-        eval_type = 'all'
-    log_dir = os.path.join(args.output_dir, args.log_num, 'evaluation')
-    os.makedirs(log_dir, exist_ok=True)
-    log_file = os.path.join(log_dir, f'shell_{eval_type}.txt')
-    logger = setlogger(log_file)
-    
-    if args.log:
-        logger.info('******************************')
-        logger.info(args)
-        logger.info('******************************')
-        logger.info(config)
-        logger.info('******************************')
-
-    
-    device = torch.device(args.device)
-
-    # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    cudnn.benchmark = True
-
-
-    #### Model #### 
-    try:
-        tokenizer = BertTokenizerFast.from_pretrained(
-            args.text_encoder,
-            local_files_only=args.local_files_only
-        )
-    except Exception as e:
-        raise RuntimeError(
-            "Failed to load text encoder/tokenizer. For offline evaluation, set --text_encoder to a local "
-            "bert-base-uncased directory and pass --local_files_only."
-        ) from e
-    if args.log:
-        print(f"Creating MAMMER")
-    model = HAMMER(
-        args=args,
-        config=config,
-        text_encoder=args.text_encoder,
-        tokenizer=tokenizer,
-        init_deit=(not args.no_deit_init),
-    )
-    
-    model = model.to(device)   
-
-    checkpoint_dir = resolve_checkpoint_path(args)
-    checkpoint = load_checkpoint_file(checkpoint_dir)
-    state_dict = extract_state_dict(checkpoint, checkpoint_dir)
-
-    if any(k.startswith('module.') for k in state_dict.keys()):
-        state_dict = {k[len('module.'):]: v for k, v in state_dict.items()}
-
-    if 'visual_encoder.pos_embed' in state_dict:
-        pos_embed_reshaped = interpolate_pos_embed(state_dict['visual_encoder.pos_embed'], model.visual_encoder)
-        state_dict['visual_encoder.pos_embed'] = pos_embed_reshaped
-
-    # model.load_state_dict(state_dict)
-    if args.log:
-        print('load checkpoint from %s' % checkpoint_dir)
-    msg = model.load_state_dict(state_dict, strict=False)
-    if args.log:
-        print(msg)  
-
-    #### Dataset #### 
-    if args.log:
-        print("Creating dataset")
-    _, val_dataset = create_dataset(config)
-    
-    if args.distributed:  
-        samplers = create_sampler([val_dataset], [True], args.world_size, args.rank) + [None]    
-    else:
-        samplers = [None]
-
-    val_loader = create_loader([val_dataset],
-                                samplers,
-                                batch_size=[config['batch_size_val']], 
-                                num_workers=[4], 
-                                is_trains=[False], 
-                                collate_fns=[None])[0]
-
-    
-    model_without_ddp = model
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-        model_without_ddp = model.module
-
-    if args.log:
-        print("Start evaluation")
-
-    AUC_cls, ACC_cls, ERR_cls, EER_cls, Precision_cls, Recall_cls, F1_cls, MCC_cls, Specificity_cls, BACC_cls, \
-    ACC_multicls, Macro_F1_multicls, Weighted_F1_multicls, \
-    MAP, OP, OR, OF1, CP, CR, CF1, F1_multicls, \
-    IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-    ACC_tok, Precision_tok, Recall_tok, F1_tok  = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
-    #============ evaluation info ============#
-    val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
-                    "ACC_cls": "{:.4f}".format(ACC_cls*100),
-                    "ERR_cls": "{:.4f}".format(ERR_cls*100),
-                    "EER_cls": "{:.4f}".format(EER_cls*100),
-                    "Precision_cls": "{:.4f}".format(Precision_cls*100),
-                    "Recall_cls": "{:.4f}".format(Recall_cls*100),
-                    "F1_cls": "{:.4f}".format(F1_cls*100),
-                    "MCC_cls": "{:.4f}".format(MCC_cls*100),
-                    "Specificity_cls": "{:.4f}".format(Specificity_cls*100),
-                    "BACC_cls": "{:.4f}".format(BACC_cls*100),
-                    "ACC_multicls": "{:.4f}".format(ACC_multicls*100),
-                    "Macro_F1_multicls": "{:.4f}".format(Macro_F1_multicls*100),
-                    "Weighted_F1_multicls": "{:.4f}".format(Weighted_F1_multicls*100),
-                    "MAP": "{:.4f}".format(MAP*100),
-                    "OP": "{:.4f}".format(OP*100),
-                    "OR": "{:.4f}".format(OR*100),
-                    "OF1": "{:.4f}".format(OF1*100),
-                    "CP": "{:.4f}".format(CP*100),
-                    "CR": "{:.4f}".format(CR*100),
-                    "CF1": "{:.4f}".format(CF1*100),
-                    "F1_FS": "{:.4f}".format(F1_multicls[0]*100),
-                    "F1_FA": "{:.4f}".format(F1_multicls[1]*100),
-                    "F1_TS": "{:.4f}".format(F1_multicls[2]*100),
-                    "F1_TA": "{:.4f}".format(F1_multicls[3]*100),
-                    "IOU_score": "{:.4f}".format(IOU_score*100),
-                    "IOU_ACC_50": "{:.4f}".format(IOU_ACC_50*100),
-                    "IOU_ACC_75": "{:.4f}".format(IOU_ACC_75*100),
-                    "IOU_ACC_95": "{:.4f}".format(IOU_ACC_95*100),
-                    "ACC_tok": "{:.4f}".format(ACC_tok*100),
-                    "Precision_tok": "{:.4f}".format(Precision_tok*100),
-                    "Recall_tok": "{:.4f}".format(Recall_tok*100),
-                    "F1_tok": "{:.4f}".format(F1_tok*100),
+    # 2. 准备数据集
+    CFG = {
+        "max_seq_len": 1024,
+        "image_size": 768,
+        "batch_size": args.batch_size
     }
-    
-    if utils.is_main_process(): 
-        log_stats = {**{f'val_{k}': v for k, v in val_stats.items()},
-                        'epoch': args.test_epoch,
-                    }             
-        with open(os.path.join(log_dir, f"results_{eval_type}.txt"),"a") as f:
-            f.write(json.dumps(log_stats) + "\n")
+    print(f"[*] 加载测试数据: {args.test_file}")
+    test_dataset = DGM4_Dataset(config=CFG, is_train=False, is_test=True, ann_files=[args.test_file])
+    test_loader = DataLoader(
+        test_dataset, 
+        batch_size=CFG["batch_size"], 
+        shuffle=False, 
+        num_workers=4, 
+        collate_fn=test_dataset.collate_fn
+    )
 
- 
-if __name__ == '__main__':
+    # 3. 提取所需的 Token IDs
+    token_ids = {
+        letter: _resolve_letter_token_ids(processor.tokenizer, letter)
+        for letter in ["A", "B", "C", "D", "E"]
+    }
+
+    all_gts = []
+    all_preds = []
+    all_fake_scores = []
+
+    # 4. 推理过程
+    print("[*] 开始评估推理...")
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc="Testing"):
+            prompts = batch["prompts"]
+            images = batch["images"]
+            gt_vectors = batch["muti_ans"].cpu().numpy() # Ground Truth shape [B, 4]
+
+            inputs = processor(
+                text=prompts,
+                images=images,
+                return_tensors="pt",
+                padding=True,
+                do_rescale=True
+            ).to(device)
+
+            # 生成文本并输出 logits (用于计算概率)
+            outputs = model.generate(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values=inputs["pixel_values"],
+                max_new_tokens=20,
+                num_beams=1,
+                do_sample=False,
+                output_scores=True,
+                return_dict_in_generate=True,
+            )
+
+            # 提取连续值假新闻概率 (0~1)
+            p_fake = _extract_fake_prob_from_outputs(outputs, token_ids)
+            all_fake_scores.append(p_fake)
+
+            # 解析生成的文本
+            generated_texts = processor.batch_decode(outputs.sequences, skip_special_tokens=True)
+            pred_vecs = []
+            for txt in generated_texts:
+                pred_vecs.append(parse_prediction_vector(txt))
+            
+            all_preds.append(pred_vecs)
+            all_gts.append(gt_vectors)
+
+    # 5. 合并并计算指标
+    all_preds = np.concatenate(all_preds, axis=0)        # Shape: [N, 4]
+    all_gts = np.concatenate(all_gts, axis=0)            # Shape: [N, 4]
+    fake_scores = np.concatenate(all_fake_scores, axis=0) # Shape: [N]
+
+    # ========== 指标计算核心区 ==========
+
+    print("\n" + "="*40)
+    print("           DGM4 测试结果汇总")
+    print("="*40)
+
+    # 【1】 二分类指标 (基于连续值 fake_scores 计算)
+    # Ground Truth 二分类化: 如果 4 个维度(B,C,D,E)全为0则是真(0)，只要有1则是假(1)
+    bin_true = (all_gts.sum(axis=1) > 0).astype(int)
+    
+    # ACC: 利用连续概率通过 0.5 阈值进行判断
+    bin_pred_continuous = (fake_scores >= 0.5).astype(int)
+    acc_bin = accuracy_score(bin_true, bin_pred_continuous)
+    
+    # AUC
+    auc_score = roc_auc_score(bin_true, fake_scores)
+    
+    # EER (ERR)
+    eer_score = calculate_eer(bin_true, fake_scores)
+
+    print("\n--- 【二分类 (真 vs 假)】 ---")
+    print(f"AUC (连续值): {auc_score:.4f}")
+    print(f"ERR (EER)   : {eer_score:.4f}")
+    print(f"ACC (连续值): {acc_bin:.4f}")
+
+
+    # 【2】 多分类/多标签指标 (基于解析后的 A/B/C/D/E 预测向量计算)
+    # ACC: 多标签下的 exact match accuracy (完全匹配率)
+    acc_multi = accuracy_score(all_gts, all_preds)
+    
+    # Macro F1
+    macro_f1 = f1_score(all_gts, all_preds, average='macro', zero_division=0)
+    
+    # Weighted F1
+    weighted_f1 = f1_score(all_gts, all_preds, average='weighted', zero_division=0)
+
+    print("\n--- 【多分类 (四种篡改类型)】 ---")
+    print(f"Exact ACC   : {acc_multi:.4f}")
+    print(f"Macro F1    : {macro_f1:.4f}")
+    print(f"Weighted F1 : {weighted_f1:.4f}")
+    print("="*40 + "\n")
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', default='./configs/Pretrain.yaml')
-    parser.add_argument('--checkpoint', default='',
-                        help='manual checkpoint file OR save_pretrained directory for testing; overrides output_dir/log_num/test_epoch')
-    parser.add_argument('--resume', default=False, type=bool)
-    parser.add_argument('--output_dir', default='/mnt/lustre/share/rshao/data/FakeNews/Ours/results')
-    parser.add_argument('--text_encoder', default='bert-base-uncased')
-    parser.add_argument('--local_files_only', default=False, action='store_true')
-    parser.add_argument('--no_deit_init', default=False, action='store_true')
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--seed', default=777, type=int)
-    # parser.add_argument('--world_size', default=1, type=int, help='number of distributed processes')    
-    # parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
-    parser.add_argument('--distributed', default=False, type=bool)
-    parser.add_argument('--rank', default=-1, type=int,
-                        help='node rank for distributed training')
-    parser.add_argument('--world_size', default=1, type=int,
-                        help='world size for distributed training')
-    parser.add_argument('--dist-url', default='tcp://127.0.0.1:23451', type=str,
-                        help='url used to set up distributed training')
-    parser.add_argument('--dist-backend', default='nccl', type=str,
-                        help='distributed backend')
-    parser.add_argument('--launcher', choices=['none', 'pytorch', 'slurm', 'mpi'], default='none',
-                        help='job launcher')
-    parser.add_argument('--log_num', '-l', type=str)
-    parser.add_argument('--model_save_epoch', type=int, default=5)
-    parser.add_argument('--token_momentum', default=False, action='store_true')
-    parser.add_argument('--test_epoch', default='best', type=str)
+    # 你的分片权重目录 (比如 train.py 中保存 best_model 的路径)
+    parser.add_argument('--checkpoint', type=str, required=True, 
+                        help="HuggingFace 格式的模型保存目录 (存放着 .bin / .safetensors 和 index.json 的文件夹)")
+    # 测试集路径
+    parser.add_argument('--test_file', type=str, required=True, 
+                        help="测试集 json 文件路径")
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--device', type=str, default="cuda:0")
 
     args = parser.parse_args()
-
-    config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
- 
-    main_worker(0, args, config)
+    evaluate(args)
