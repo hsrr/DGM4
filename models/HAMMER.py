@@ -247,49 +247,22 @@ class HAMMER(nn.Module):
                                               key=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]), 
                                               value=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]))[0]
             output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
-            loss_bbox, loss_giou = self.get_bbox_loss(output_coord, fake_image_box)
+            # Keep bbox branch forward path unchanged, but remove GT supervision.
+            loss_bbox = output_coord.sum() * 0.0
+            loss_giou = output_coord.sum() * 0.0
             
             ##================= TMG ========================##    
-            token_label = text.attention_mask[:,1:].clone() # [:,1:] for ingoring class token
-            token_label[token_label==0] = -100 # -100 index = padding token
-            token_label[token_label==1] = 0
-
-            for batch_idx in range(len(fake_text_pos)):
-                fake_pos_sample = fake_text_pos[batch_idx]
-                if fake_pos_sample:
-                    for pos in fake_pos_sample:
-                        token_label[batch_idx, pos] = 1
-
             input_ids = text.input_ids.clone()
 
-            if self.args.token_momentum:
-                with torch.no_grad():
-                    logits_m = self.text_encoder_m(input_ids, 
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds_m,
-                                                encoder_attention_mask = image_atts,      
-                                                return_dict = True,
-                                                return_logits = True,   
-                                                )    
-                token_cls_output = self.text_encoder(input_ids, 
-                                            attention_mask = text.attention_mask,
-                                            encoder_hidden_states = image_embeds,
-                                            encoder_attention_mask = image_atts,      
-                                            return_dict = True,
-                                            labels = token_label,   
-                                            soft_labels = F.softmax(logits_m.view(-1, 2),dim=-1),
-                                            alpha = alpha
-                                            )    
-            else:
-                token_cls_output  = self.text_encoder(input_ids, 
-                                            attention_mask = text.attention_mask,
-                                            encoder_hidden_states = image_embeds,
-                                            encoder_attention_mask = image_atts,      
-                                            return_dict = True,
-                                            labels = token_label,   
-                                            )  
-
-            loss_TMG = token_cls_output.loss
+            logits_tok = self.text_encoder(input_ids, 
+                                        attention_mask = text.attention_mask,
+                                        encoder_hidden_states = image_embeds,
+                                        encoder_attention_mask = image_atts,      
+                                        return_dict = True,
+                                        return_logits = True,   
+                                        )
+            # Keep token branch forward path unchanged, but remove GT supervision.
+            loss_TMG = logits_tok.sum() * 0.0
 
             return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC
 

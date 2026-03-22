@@ -21,10 +21,15 @@ from random import random as rand
 class DGM4_Dataset(Dataset):
     def __init__(self, config, ann_file, transform, max_words=30, is_train=True): 
         
-        self.root_dir = '../../datasets'       
+        self.root_dir = config.get('data_root', '../../datasets')
         self.ann = []
         for f in ann_file:
             self.ann += json.load(open(f,'r'))
+        source_filter_key = 'train_sources' if is_train else 'val_sources'
+        source_filter = config.get(source_filter_key, [])
+        if source_filter:
+            source_filter = set([self._normalize_source_name(x) for x in source_filter])
+            self.ann = [ann for ann in self.ann if self._infer_source(ann) in source_filter]
         if 'dataset_division' in config:
             self.ann = self.ann[:int(len(self.ann)/config['dataset_division'])]
 
@@ -33,6 +38,51 @@ class DGM4_Dataset(Dataset):
         self.image_res = config['image_res']
 
         self.is_train = is_train
+
+    def _normalize_source_name(self, source_name):
+        source_name = str(source_name).lower().strip().replace('-', '_').replace(' ', '_')
+        alias = {
+            'gardian': 'guardian',
+            'the_guardian': 'guardian',
+            'usatoday': 'usa_today',
+            'usa-today': 'usa_today',
+            'washingtonpost': 'washington_post',
+            'washington-post': 'washington_post',
+        }
+        return alias.get(source_name, source_name)
+
+    def _infer_source(self, ann):
+        source_keys = ['source', 'news_source', 'media_source', 'website', 'domain', 'outlet', 'publisher']
+        for key in source_keys:
+            if key in ann and ann[key]:
+                return self._normalize_source_name(ann[key])
+
+        image_path = str(ann.get('image', '')).lower().replace('\\', '/')
+        if 'gardian' in image_path or 'guardian' in image_path:
+            return 'guardian'
+        if 'usa_today' in image_path or 'usatoday' in image_path:
+            return 'usa_today'
+        if 'washington_post' in image_path or 'washingtonpost' in image_path:
+            return 'washington_post'
+        if '/bbc/' in image_path or image_path.startswith('bbc/'):
+            return 'bbc'
+        return None
+
+    def _resolve_image_path(self, img_dir):
+        if os.path.isabs(img_dir):
+            return img_dir
+
+        candidates = [
+            os.path.join(self.root_dir, img_dir),
+            os.path.join(self.root_dir, os.path.basename(img_dir)),
+        ]
+        if img_dir.startswith('DGM4/'):
+            candidates.append(os.path.join(self.root_dir, img_dir[len('DGM4/'):]))
+
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return candidates[0]
         
     def __len__(self):
         return len(self.ann)
@@ -47,7 +97,7 @@ class DGM4_Dataset(Dataset):
         
         ann = self.ann[index]
         img_dir = ann['image']    
-        image_dir_all = f'{self.root_dir}/{img_dir}'
+        image_dir_all = self._resolve_image_path(img_dir)
 
         try:
             image = Image.open(image_dir_all).convert('RGB')   

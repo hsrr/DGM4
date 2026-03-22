@@ -35,13 +35,49 @@ from types import MethodType
 from tools.env import init_dist
 from tqdm import tqdm
 
-from sklearn.metrics import roc_auc_score, roc_curve, f1_score
-from scipy.optimize import brentq
-from scipy.interpolate import interp1d
-
-from models import box_ops
+from sklearn.metrics import roc_auc_score
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 from models.HAMMER import HAMMER
+
+
+def _parse_csv_arg(value):
+    if value is None:
+        return None
+    items = [x.strip() for x in value.split(',') if x.strip()]
+    return items
+
+
+def apply_config_overrides(config, args):
+    if args.data_root:
+        config['data_root'] = args.data_root
+    if args.train_file:
+        config['train_file'] = [x.strip() for x in args.train_file.split(',') if x.strip()]
+    if args.val_file:
+        config['val_file'] = [x.strip() for x in args.val_file.split(',') if x.strip()]
+
+    train_sources = _parse_csv_arg(args.train_sources)
+    if train_sources is not None:
+        config['train_sources'] = train_sources
+    val_sources = _parse_csv_arg(args.val_sources)
+    if val_sources is not None:
+        config['val_sources'] = val_sources
+
+
+def safe_barrier():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+def _safe_multilabel_metrics(meter):
+    if meter.scores.numel() == 0:
+        return float('nan'), float('nan')
+    map_tensor = meter.value()
+    map_score = map_tensor.mean().item() if torch.is_tensor(map_tensor) else float(map_tensor)
+    overall = meter.overall()
+    if isinstance(overall, tuple):
+        _, _, _, _, _, cf1 = overall
+    else:
+        cf1 = float('nan')
+    return map_score, cf1
 
 def setlogger(log_file):
     filehandler = logging.FileHandler(log_file)
@@ -104,9 +140,6 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=50, fmt='{value:.6f}'))
     metric_logger.add_meter('loss_MAC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_BIC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('loss_bbox', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('loss_giou', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
-    metric_logger.add_meter('loss_TMG', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss_MLC', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     metric_logger.add_meter('loss', utils.SmoothedValue(window_size=50, fmt='{value:.4f}'))
     
@@ -140,11 +173,9 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC = model(image, label, text_input, fake_image_box, fake_token_pos, alpha = alpha)  
             
+        # bbox and token branches still run forward, but their GT-based losses are disabled in model.forward.
         loss = config['loss_MAC_wgt']*loss_MAC \
              + config['loss_BIC_wgt']*loss_BIC \
-             + config['loss_bbox_wgt']*loss_bbox \
-             + config['loss_giou_wgt']*loss_giou \
-             + config['loss_TMG_wgt']*loss_TMG \
              + config['loss_MLC_wgt']*loss_MLC \
           
         loss.backward()
@@ -152,9 +183,6 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
         
         metric_logger.update(loss_MAC=loss_MAC.item())
         metric_logger.update(loss_BIC=loss_BIC.item())
-        metric_logger.update(loss_bbox=loss_bbox.item())
-        metric_logger.update(loss_giou=loss_giou.item())
-        metric_logger.update(loss_TMG=loss_TMG.item())
         metric_logger.update(loss_MLC=loss_MLC.item())
         metric_logger.update(loss=loss.item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])         
@@ -171,9 +199,6 @@ def train(args, model, data_loader, optimizer, tokenizer, epoch, warmup_steps, d
                 'lr': optimizer.param_groups[0]["lr"],                                                                                                  
                 'loss_MAC': loss_MAC.item(),                                                                                                  
                 'loss_BIC': loss_BIC.item(),                                                                                                  
-                'loss_bbox': loss_bbox.item(),                                                                                                  
-                'loss_giou': loss_giou.item(),                                                                                                  
-                'loss_TMG': loss_TMG.item(),                                                                                                  
                 'loss_MLC': loss_MLC.item(),                                                                                                  
                 'loss': loss.item(),                                                                                                  
                     } 
@@ -200,14 +225,9 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     start_time = time.time()   
     print_freq = 200 
 
-    y_true, y_pred, IOU_pred, IOU_50, IOU_75, IOU_95 = [], [], [], [], [], []
+    y_true, y_pred = [], []
     cls_nums_all = 0
     cls_acc_all = 0   
-    
-    TP_all = 0
-    TN_all = 0
-    FP_all = 0
-    FN_all = 0
 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
@@ -238,75 +258,17 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         target, _ = get_multi_label(label, image)
         multi_label_meter.add(logits_multicls, target)
         
-        ##================= bbox cls ========================## 
-        boxes1 = box_ops.box_cxcywh_to_xyxy(output_coord)
-        boxes2 = box_ops.box_cxcywh_to_xyxy(fake_image_box)
-
-        IOU, _ = box_ops.box_iou(boxes1, boxes2.to(device), test=True)
-
-        IOU_pred.extend(IOU.cpu().tolist())
-
-        IOU_50_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_75_bt = torch.zeros(IOU.shape, dtype=torch.long)
-        IOU_95_bt = torch.zeros(IOU.shape, dtype=torch.long)
-
-        IOU_50_bt[IOU>0.5] = 1
-        IOU_75_bt[IOU>0.75] = 1
-        IOU_95_bt[IOU>0.95] = 1
-
-        IOU_50.extend(IOU_50_bt.cpu().tolist())
-        IOU_75.extend(IOU_75_bt.cpu().tolist())
-        IOU_95.extend(IOU_95_bt.cpu().tolist())
-
-        ##================= token cls ========================##  
-        token_label = text_input.attention_mask[:,1:].clone() # [:,1:] for ingoring class token
-        token_label[token_label==0] = -100 # -100 index = padding token
-        token_label[token_label==1] = 0
-
-        for batch_idx in range(len(fake_token_pos)):
-            fake_pos_sample = fake_token_pos[batch_idx]
-            if fake_pos_sample:
-                for pos in fake_pos_sample:
-                    token_label[batch_idx, pos] = 1
-                    
-        logits_tok_reshape = logits_tok.view(-1, 2)
-        logits_tok_pred = logits_tok_reshape.argmax(1)
-        token_label_reshape = token_label.view(-1)
-        
-        # F1
-        TP_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 1)).item()
-        TN_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 0)).item()
-        FP_all += torch.sum((token_label_reshape == 0) * (logits_tok_pred == 1)).item()
-        FN_all += torch.sum((token_label_reshape == 1) * (logits_tok_pred == 0)).item()
-
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
-    AUC_cls = roc_auc_score(y_true, y_pred)
-    ACC_cls = cls_acc_all / cls_nums_all
-    fpr, tpr, thresholds = roc_curve(y_true, y_pred, pos_label=1)
-    EER_cls = brentq(lambda x: 1. - x - interp1d(fpr, tpr)(x), 0., 1.)
+    try:
+        AUC_cls = roc_auc_score(y_true, y_pred)
+    except ValueError:
+        AUC_cls = float('nan')
+    ACC_cls = cls_acc_all / cls_nums_all if cls_nums_all > 0 else float('nan')
     
     ##================= multi-label cls ========================## 
-    MAP = multi_label_meter.value().mean()
-    OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
-    OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k = multi_label_meter.overall_topk(3)
-    
-    ##================= bbox cls ========================##
-    IOU_score = sum(IOU_pred)/len(IOU_pred)
-    IOU_ACC_50 = sum(IOU_50)/len(IOU_50)
-    IOU_ACC_75 = sum(IOU_75)/len(IOU_75)
-    IOU_ACC_95 = sum(IOU_95)/len(IOU_95)
-
-    # ##================= token cls========================##
-    ACC_tok = (TP_all + TN_all) / (TP_all + TN_all + FP_all + FN_all)
-    Precision_tok = TP_all / (TP_all + FP_all)
-    Recall_tok = TP_all / (TP_all + FN_all)
-    F1_tok = 2*Precision_tok*Recall_tok / (Precision_tok + Recall_tok)
-
-    return AUC_cls, ACC_cls, EER_cls, \
-           MAP.item(), OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
-           IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-           ACC_tok, Precision_tok, Recall_tok, F1_tok
+    MAP, CF1 = _safe_multilabel_metrics(multi_label_meter)
+    return AUC_cls, ACC_cls, MAP, CF1
     
 def main_worker(gpu, args, config):
 
@@ -346,7 +308,7 @@ def main_worker(gpu, args, config):
     start_epoch = 0
     max_epoch = config['schedular']['epochs']
     warmup_steps = config['schedular']['warmup_epochs']  
-    best = 0
+    best = float('-inf')
     best_epoch = 0  
 
     #### Dataset #### 
@@ -410,39 +372,15 @@ def main_worker(gpu, args, config):
     for epoch in range(start_epoch, max_epoch):
             
         train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
-        AUC_cls, ACC_cls, EER_cls, \
-        MAP, OP, OR, OF1, CP, CR, CF1, OP_k, OR_k, OF1_k, CP_k, CR_k, CF1_k, \
-        IOU_score, IOU_ACC_50, IOU_ACC_75, IOU_ACC_95, \
-        ACC_tok, Precision_tok, Recall_tok, F1_tok \
-        = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+        AUC_cls, ACC_cls, MAP, CF1 = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
 
         #============ tensorboard train log info ============#
         if args.log:
             lossinfo = {
                 'AUC_cls': round(AUC_cls*100, 4),                                                                                                  
                 'ACC_cls': round(ACC_cls*100, 4),                                                                                                  
-                'EER_cls': round(EER_cls*100, 4),                                                                                                  
                 'MAP': round(MAP*100, 4),                                                                                                  
-                'OP': round(OP*100, 4),                                                                                                  
-                'OR': round(OR*100, 4), 
-                'OF1': round(OF1*100, 4), 
-                'CP': round(CP*100, 4), 
-                'CR': round(CR*100, 4), 
                 'CF1': round(CF1*100, 4), 
-                'OP_k': round(OP_k*100, 4), 
-                'OR_k': round(OR_k*100, 4), 
-                'OF1_k': round(OF1_k*100, 4), 
-                'CP_k': round(CP_k*100, 4), 
-                'CR_k': round(CR_k*100, 4), 
-                'CF1_k': round(CF1_k*100, 4), 
-                'IOU_score': round(IOU_score*100, 4),                                                                                                  
-                'IOU_ACC_50': round(IOU_ACC_50*100, 4),                                                                                                  
-                'IOU_ACC_75': round(IOU_ACC_75*100, 4),                                                                                                  
-                'IOU_ACC_95': round(IOU_ACC_95*100, 4),                                                                                                  
-                'ACC_tok': round(ACC_tok*100, 4),                                                                                                  
-                'Precision_tok': round(Precision_tok*100, 4),                                                                                                  
-                'Recall_tok': round(Recall_tok*100, 4),                                                                                                  
-                'F1_tok': round(F1_tok*100, 4),                                                                                                  
                     } 
             for tag, value in lossinfo.items():
                 summary_writer.add_scalar(tag, value, epoch)
@@ -450,28 +388,8 @@ def main_worker(gpu, args, config):
         #============ evaluation info ============#
         val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
                      "ACC_cls": "{:.4f}".format(ACC_cls*100),
-                     "EER_cls": "{:.4f}".format(EER_cls*100),
                      "MAP": "{:.4f}".format(MAP*100),
-                     "OP": "{:.4f}".format(OP*100),
-                     "OR": "{:.4f}".format(OR*100),
-                     "OF1": "{:.4f}".format(OF1*100),
-                     "CP": "{:.4f}".format(CP*100),
-                     "CR": "{:.4f}".format(CR*100),
                      "CF1": "{:.4f}".format(CF1*100),
-                     "OP_k": "{:.4f}".format(OP_k*100),
-                     "OR_k": "{:.4f}".format(OR_k*100),
-                     "OF1_k": "{:.4f}".format(OF1_k*100),
-                     "CP_k": "{:.4f}".format(CP_k*100),
-                     "CR_k": "{:.4f}".format(CR_k*100),
-                     "CF1_k": "{:.4f}".format(CF1_k*100),
-                     "IOU_score": "{:.4f}".format(IOU_score*100),
-                     "IOU_ACC_50": "{:.4f}".format(IOU_ACC_50*100),
-                     "IOU_ACC_75": "{:.4f}".format(IOU_ACC_75*100),
-                     "IOU_ACC_95": "{:.4f}".format(IOU_ACC_95*100),
-                     "ACC_tok": "{:.4f}".format(ACC_tok*100),
-                     "Precision_tok": "{:.4f}".format(Precision_tok*100),
-                     "Recall_tok": "{:.4f}".format(Recall_tok*100),
-                     "F1_tok": "{:.4f}".format(F1_tok*100),
         }
         
         if utils.is_main_process(): 
@@ -500,14 +418,15 @@ def main_worker(gpu, args, config):
                 }                    
             if (epoch % args.model_save_epoch == 0 and epoch!=0):
                 torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch)) 
-            if float(val_stats['AUC_cls'])>best:
+            current_score = AUC_cls if np.isfinite(AUC_cls) else ACC_cls
+            if current_score > best:
                 torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth')) 
-                best = float(val_stats['AUC_cls'])
+                best = current_score
                 best_epoch = epoch 
 
         if config['schedular']['sched'] != 'cosine_in_step':
             lr_scheduler.step(epoch+warmup_steps+1)  
-        dist.barrier() 
+        safe_barrier() 
 
     if utils.is_main_process():
         torch.save(save_obj, os.path.join(log_dir, 'checkpoint_%02d.pth'%epoch))   
@@ -542,10 +461,16 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=20)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--data_root', default=None, type=str)
+    parser.add_argument('--train_file', default=None, type=str, help='comma-separated json paths')
+    parser.add_argument('--val_file', default=None, type=str, help='comma-separated json paths')
+    parser.add_argument('--train_sources', default=None, type=str, help='comma-separated sources')
+    parser.add_argument('--val_sources', default=None, type=str, help='comma-separated sources')
 
     args = parser.parse_args()
 
     config = yaml.load(open(args.config, 'r'), Loader=yaml.Loader)
+    apply_config_overrides(config, args)
 
     # main(args, config)
     if args.launcher == 'none':
