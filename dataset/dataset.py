@@ -18,13 +18,50 @@ import math
 import random
 from random import random as rand
 
+
+def _load_annotations_file(path):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        content = f.read().strip()
+
+    if not content:
+        return []
+
+    # 1) Standard JSON (list or single object)
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        data = None
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    if data is not None:
+        raise ValueError(f"Unsupported annotation JSON type in {path}: {type(data)}")
+
+    # 2) JSONL / NDJSON (one JSON object per line)
+    annotations = []
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed parsing annotation line {line_no} in {path}: {e}") from e
+        if not isinstance(item, dict):
+            raise ValueError(f"Line {line_no} in {path} is not a JSON object.")
+        annotations.append(item)
+    return annotations
+
+
 class DGM4_Dataset(Dataset):
     def __init__(self, config, ann_file, transform, max_words=30, is_train=True): 
         
         self.root_dir = config.get('data_root', '../../datasets')
         self.ann = []
         for f in ann_file:
-            self.ann += json.load(open(f,'r'))
+            self.ann += _load_annotations_file(f)
         source_filter_key = 'train_sources' if is_train else 'val_sources'
         source_filter = config.get(source_filter_key, [])
         if source_filter:
