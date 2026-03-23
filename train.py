@@ -432,6 +432,12 @@ def main_worker(gpu, args, config):
                                 num_workers=[4, 4], 
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            "Train dataloader is empty on this rank. "
+            "Please check train_sources filtering and/or reduce batch_size_train "
+            "or GPU count so each rank has at least one batch."
+        )
 
     tokenizer = _build_tokenizer_with_fallback(args.text_encoder, local_files_only=args.local_files_only)
 

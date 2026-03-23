@@ -37,9 +37,16 @@ def create_sampler(datasets, shuffles, num_tasks, global_rank):
 def create_loader(datasets, samplers, batch_size, num_workers, is_trains, collate_fns):
     loaders = []
     for dataset,sampler,bs,n_worker,is_train,collate_fn in zip(datasets,samplers,batch_size,num_workers,is_trains,collate_fns):
+        if sampler is not None:
+            num_samples_this_rank = len(sampler)
+        else:
+            num_samples_this_rank = len(dataset)
         if is_train:
             shuffle = (sampler is None)
-            drop_last = True
+            # Avoid empty train loaders in distributed/small-data settings.
+            # If this rank has fewer samples than batch_size, keeping drop_last=True
+            # would drop the only partial batch and produce zero iterations.
+            drop_last = num_samples_this_rank >= bs
         else:
             shuffle = False
             drop_last = False
