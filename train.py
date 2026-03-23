@@ -413,7 +413,7 @@ def main_worker(gpu, args, config):
     best_epoch = 0  
     best_val_loss = float('inf')
     best_val_loss_epoch = 0
-    early_stop_patience = 3
+    early_stop_patience = int(config.get('early_stop_patience', 3))
     no_improve_epochs = 0
 
     #### Dataset #### 
