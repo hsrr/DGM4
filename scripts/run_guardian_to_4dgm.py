@@ -110,7 +110,7 @@ def main():
         summary[source] = {
             "AUC_cls": data.get("val_AUC_cls"),
             "ACC_cls": data.get("val_ACC_cls"),
-            "ERR_cls": data.get("val_ERR_cls"),
+            "EER_cls": data.get("val_EER_cls"),
             "Binary_F1": data.get("val_Binary_F1"),
             "MAP": data.get("val_MAP"),
             "ERR_multi": data.get("val_ERR_multi"),
@@ -130,7 +130,7 @@ def main():
             f"{source:16s} "
             f"AUC={metrics['AUC_cls']} "
             f"ACC={metrics['ACC_cls']} "
-            f"ERR={metrics['ERR_cls']} "
+            f"EER={metrics['EER_cls']} "
             f"BinaryF1={metrics['Binary_F1']} "
             f"mAP={metrics['MAP']} "
             f"multiERR={metrics['ERR_multi']} "

@@ -35,7 +35,7 @@ from types import MethodType
 from tools.env import init_dist
 from tqdm import tqdm
 
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score, roc_curve
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 
 from models.HAMMER import HAMMER
@@ -107,9 +107,27 @@ def _safe_binary_metrics(y_true, y_score, y_pred_label):
         auc = float('nan')
 
     acc = float(np.mean(y_pred_label == y_true))
-    err = 1.0 - acc
+    try:
+        fpr, tpr, _ = roc_curve(y_true, y_score, pos_label=1)
+        fnr = 1.0 - tpr
+        diff = fpr - fnr
+        cross_idx = np.where(diff[:-1] * diff[1:] <= 0)[0]
+        if cross_idx.size > 0:
+            i = int(cross_idx[0])
+            x0, x1 = diff[i], diff[i + 1]
+            y0, y1 = fpr[i], fpr[i + 1]
+            if x1 == x0:
+                eer = float(y0)
+            else:
+                t = float(-x0 / (x1 - x0))
+                eer = float(y0 + t * (y1 - y0))
+        else:
+            i = int(np.argmin(np.abs(diff)))
+            eer = float((fpr[i] + fnr[i]) / 2.0)
+    except ValueError:
+        eer = float('nan')
     f1 = f1_score(y_true, y_pred_label, zero_division=0)
-    return auc, acc, err, f1
+    return auc, acc, eer, f1
 
 
 def text_input_adjust(text_input, fake_word_pos, device):
@@ -195,7 +213,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
     y_pred_label = np.array(y_pred_label)
-    AUC_cls, ACC_cls, ERR_cls, BINARY_F1 = _safe_binary_metrics(y_true, y_pred, y_pred_label)
+    AUC_cls, ACC_cls, EER_cls, BINARY_F1 = _safe_binary_metrics(y_true, y_pred, y_pred_label)
     ##================= multi-label cls ========================## 
     MAP, CF1, OC1 = _safe_multilabel_metrics(multi_label_meter)
     ERR_multi = 1.0 - (multi_exact_correct_all / multi_nums_all) if multi_nums_all > 0 else float('nan')
@@ -203,7 +221,7 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     return {
         "AUC_cls": AUC_cls,
         "ACC_cls": ACC_cls,
-        "ERR_cls": ERR_cls,
+        "EER_cls": EER_cls,
         "Binary_F1": BINARY_F1,
         "MAP": MAP,
         "ERR_multi": ERR_multi,
@@ -299,7 +317,7 @@ def main_worker(gpu, args, config):
     #============ evaluation info ============#
     val_stats = {"AUC_cls": "{:.4f}".format(metrics["AUC_cls"]*100),
                     "ACC_cls": "{:.4f}".format(metrics["ACC_cls"]*100),
-                    "ERR_cls": "{:.4f}".format(metrics["ERR_cls"]*100),
+                    "EER_cls": "{:.4f}".format(metrics["EER_cls"]*100),
                     "Binary_F1": "{:.4f}".format(metrics["Binary_F1"]*100),
                     "MAP": "{:.4f}".format(metrics["MAP"]*100),
                     "ERR_multi": "{:.4f}".format(metrics["ERR_multi"]*100),
