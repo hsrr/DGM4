@@ -222,12 +222,13 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     header = 'Evaluation:'    
     
     print('Computing features for evaluation...')
-    start_time = time.time()   
     print_freq = 200 
 
     y_true, y_pred = [], []
     cls_nums_all = 0
     cls_acc_all = 0   
+    val_loss_sum = 0.0
+    val_sample_count = 0
 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
@@ -257,6 +258,13 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
         multi_label_meter.add(logits_multicls, target)
+        loss_BIC = F.cross_entropy(logits_real_fake, cls_label)
+        loss_MLC = F.binary_cross_entropy_with_logits(logits_multicls, target.type(torch.float))
+        # Validation loss follows the active label-supervision objective.
+        batch_val_loss = config['loss_BIC_wgt'] * loss_BIC + config['loss_MLC_wgt'] * loss_MLC
+        batch_size = cls_label.shape[0]
+        val_loss_sum += batch_val_loss.item() * batch_size
+        val_sample_count += batch_size
         
     ##================= real/fake cls ========================## 
     y_true, y_pred = np.array(y_true), np.array(y_pred)
@@ -268,7 +276,8 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     
     ##================= multi-label cls ========================## 
     MAP, CF1 = _safe_multilabel_metrics(multi_label_meter)
-    return AUC_cls, ACC_cls, MAP, CF1
+    val_loss = val_loss_sum / val_sample_count if val_sample_count > 0 else float('nan')
+    return AUC_cls, ACC_cls, MAP, CF1, val_loss
     
 def main_worker(gpu, args, config):
 
@@ -310,6 +319,10 @@ def main_worker(gpu, args, config):
     warmup_steps = config['schedular']['warmup_epochs']  
     best = float('-inf')
     best_epoch = 0  
+    best_val_loss = float('inf')
+    best_val_loss_epoch = 0
+    early_stop_patience = 3
+    no_improve_epochs = 0
 
     #### Dataset #### 
     if args.log:
@@ -372,7 +385,7 @@ def main_worker(gpu, args, config):
     for epoch in range(start_epoch, max_epoch):
             
         train_stats = train(args, model, train_loader, optimizer, tokenizer, epoch, warmup_steps, device, lr_scheduler, config, summary_writer) 
-        AUC_cls, ACC_cls, MAP, CF1 = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+        AUC_cls, ACC_cls, MAP, CF1, val_loss = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
 
         #============ tensorboard train log info ============#
         if args.log:
@@ -380,7 +393,8 @@ def main_worker(gpu, args, config):
                 'AUC_cls': round(AUC_cls*100, 4),                                                                                                  
                 'ACC_cls': round(ACC_cls*100, 4),                                                                                                  
                 'MAP': round(MAP*100, 4),                                                                                                  
-                'CF1': round(CF1*100, 4), 
+                'CF1': round(CF1*100, 4),
+                'val_loss': round(val_loss, 6),
                     } 
             for tag, value in lossinfo.items():
                 summary_writer.add_scalar(tag, value, epoch)
@@ -390,7 +404,9 @@ def main_worker(gpu, args, config):
                      "ACC_cls": "{:.4f}".format(ACC_cls*100),
                      "MAP": "{:.4f}".format(MAP*100),
                      "CF1": "{:.4f}".format(CF1*100),
+                     "loss": "{:.6f}".format(val_loss),
         }
+        stop_training = False
         
         if utils.is_main_process(): 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -423,6 +439,30 @@ def main_worker(gpu, args, config):
                 torch.save(save_obj, os.path.join(log_dir, 'checkpoint_best.pth')) 
                 best = current_score
                 best_epoch = epoch 
+            if np.isfinite(val_loss) and val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_val_loss_epoch = epoch
+                no_improve_epochs = 0
+            else:
+                no_improve_epochs += 1
+
+            if no_improve_epochs >= early_stop_patience:
+                stop_training = True
+                if args.log:
+                    logger.info(
+                        f"Early stopping triggered at epoch {epoch}. "
+                        f"Best val loss {best_val_loss:.6f} at epoch {best_val_loss_epoch}."
+                    )
+
+        if args.distributed:
+            stop_tensor = torch.tensor(int(stop_training), device=device)
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(stop_tensor, src=0)
+            stop_training = bool(stop_tensor.item())
+
+        if stop_training:
+            safe_barrier()
+            break
 
         if config['schedular']['sched'] != 'cosine_in_step':
             lr_scheduler.step(epoch+warmup_steps+1)  
