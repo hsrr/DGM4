@@ -231,38 +231,11 @@ class HAMMER(nn.Module):
             output_cls = self.cls_head(output_pos.last_hidden_state[:,0,:])
             loss_MLC = F.binary_cross_entropy_with_logits(output_cls, multicls_label.type(torch.float))
 
-            ##================= IMG ========================## 
-            # local features of visual part
-            cls_tokens_local = self.cls_token_local.expand(bs, -1, -1)
-
-            text_attention_mask_clone = text.attention_mask.clone() # [:,1:] for ingoring class token
-            local_feat_padding_mask_text = text_attention_mask_clone==0 # 0 = pad token
-
-            local_feat_it_cross_attn = image_embeds + self.it_cross_attn(query=self.norm_layer_it_cross_atten(image_embeds), 
-                                              key=self.norm_layer_it_cross_atten(text_embeds), 
-                                              value=self.norm_layer_it_cross_atten(text_embeds),
-                                              key_padding_mask=local_feat_padding_mask_text)[0]
-
-            local_feat_aggr = self.aggregator(query=self.norm_layer_aggr(cls_tokens_local), 
-                                              key=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]), 
-                                              value=self.norm_layer_aggr(local_feat_it_cross_attn[:,1:,:]))[0]
-            output_coord = self.bbox_head(local_feat_aggr.squeeze(1)).sigmoid()
-            # Keep bbox branch forward path unchanged, but remove GT supervision.
-            loss_bbox = output_coord.sum() * 0.0
-            loss_giou = output_coord.sum() * 0.0
-            
-            ##================= TMG ========================##    
-            input_ids = text.input_ids.clone()
-
-            logits_tok = self.text_encoder(input_ids, 
-                                        attention_mask = text.attention_mask,
-                                        encoder_hidden_states = image_embeds,
-                                        encoder_attention_mask = image_atts,      
-                                        return_dict = True,
-                                        return_logits = True,   
-                                        )
-            # Keep token branch forward path unchanged, but remove GT supervision.
-            loss_TMG = logits_tok.sum() * 0.0
+            # bbox / fake-text supervision are disabled in training.
+            # Keep return signature stable for the outer training loop.
+            loss_bbox = image_embeds.new_zeros(())
+            loss_giou = image_embeds.new_zeros(())
+            loss_TMG = image_embeds.new_zeros(())
 
             return loss_MAC, loss_BIC, loss_bbox, loss_giou, loss_TMG, loss_MLC
 
