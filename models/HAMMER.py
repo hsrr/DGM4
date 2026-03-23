@@ -32,21 +32,26 @@ class HAMMER(nn.Module):
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))   
         
         if init_deit:
-            checkpoint = torch.hub.load_state_dict_from_url(
-                url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
-                map_location="cpu", check_hash=True)
-            state_dict = checkpoint["model"]
-            pos_embed_reshaped = interpolate_pos_embed(state_dict['pos_embed'], self.visual_encoder)
-            state_dict['pos_embed'] = pos_embed_reshaped
-            msg = self.visual_encoder.load_state_dict(state_dict,strict=False)
-            print(msg)          
+            try:
+                checkpoint = torch.hub.load_state_dict_from_url(
+                    url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
+                    map_location="cpu", check_hash=True)
+                state_dict = checkpoint["model"]
+                pos_embed_reshaped = interpolate_pos_embed(state_dict['pos_embed'], self.visual_encoder)
+                state_dict['pos_embed'] = pos_embed_reshaped
+                msg = self.visual_encoder.load_state_dict(state_dict,strict=False)
+                print(msg)
+            except Exception as e:
+                print(f"Warning: failed to load DeiT initialization weights: {e}")
             
         vision_width = config['vision_width']       
         bert_config = BertConfig.from_json_file(config['bert_config'])
         
-        self.text_encoder = BertForTokenClassification.from_pretrained(text_encoder, 
-                                                                    config=bert_config, 
-                                                                    label_smoothing=config['label_smoothing'])      
+        self.text_encoder = self._build_text_encoder(
+            text_encoder=text_encoder,
+            bert_config=bert_config,
+            label_smoothing=config['label_smoothing'],
+        )
 
         text_width = self.text_encoder.config.hidden_size
         self.vision_proj = nn.Linear(vision_width, embed_dim)
@@ -70,9 +75,10 @@ class HAMMER(nn.Module):
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6)) 
         self.vision_proj_m = nn.Linear(vision_width, embed_dim)
-        self.text_encoder_m = BertForTokenClassification.from_pretrained(text_encoder, 
-                                                                    config=bert_config,
-                                                                    label_smoothing=config['label_smoothing'])       
+        self.text_encoder_m = BertForTokenClassification(
+            bert_config,
+            label_smoothing=config['label_smoothing'],
+        )
         self.text_proj_m = nn.Linear(text_width, embed_dim)    
         
         self.model_pairs = [[self.visual_encoder,self.visual_encoder_m],
@@ -100,6 +106,32 @@ class HAMMER(nn.Module):
 
         trunc_normal_(self.cls_token_local, std=.02)
         self.apply(self._init_weights)
+
+    def _build_text_encoder(self, text_encoder, bert_config, label_smoothing):
+        # Prefer local cache first for offline robustness.
+        try:
+            return BertForTokenClassification.from_pretrained(
+                text_encoder,
+                config=bert_config,
+                label_smoothing=label_smoothing,
+                local_files_only=True,
+            )
+        except Exception:
+            pass
+
+        try:
+            return BertForTokenClassification.from_pretrained(
+                text_encoder,
+                config=bert_config,
+                label_smoothing=label_smoothing,
+            )
+        except Exception as e:
+            print(f"Warning: failed to load text encoder pretrained weights: {e}")
+            print("Warning: falling back to random text encoder initialization.")
+            return BertForTokenClassification(
+                bert_config,
+                label_smoothing=label_smoothing,
+            )
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

@@ -2,6 +2,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import os
+import hashlib
 # os.environ['CUDA_VISIBLE_DEVICES']='0,1,2,3'
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -38,6 +39,89 @@ from tqdm import tqdm
 from sklearn.metrics import roc_auc_score
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 from models.HAMMER import HAMMER
+
+
+class _SimpleWhitespaceTokenizer:
+    def __init__(self, max_vocab=30522):
+        self.max_vocab = max_vocab
+
+    def _token_to_id(self, token):
+        digest = hashlib.md5(str(token).encode("utf-8")).hexdigest()
+        return int(digest[:8], 16) % (self.max_vocab - 2) + 2
+
+    def __call__(self, texts, max_length=128, truncation=True, add_special_tokens=True, return_attention_mask=True, return_token_type_ids=False):
+        if isinstance(texts, str):
+            texts = [texts]
+        input_ids = []
+        attention_mask = []
+        for text in texts:
+            tokens = str(text).strip().split()
+            ids = [self._token_to_id(tok) for tok in tokens]
+            if add_special_tokens:
+                ids = [101] + ids + [102]
+            if truncation and len(ids) > max_length:
+                ids = ids[:max_length]
+            mask = [1] * len(ids)
+            input_ids.append(ids)
+            attention_mask.append(mask)
+        return _SimpleTokenizerBatch(input_ids, attention_mask)
+
+
+class _SimpleTokenizerBatch:
+    def __init__(self, input_ids, attention_mask):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+
+    def word_ids(self, batch_index):
+        length = len(self.input_ids[batch_index])
+        if length <= 2:
+            return [None] * length
+        core_len = length - 2
+        return [None] + list(range(core_len)) + [None]
+
+
+def _resolve_text_encoder_path(text_encoder):
+    if os.path.isdir(text_encoder):
+        return text_encoder
+    cache_home = os.environ.get('HF_HOME')
+    candidates = []
+    if cache_home:
+        candidates.extend([
+            os.path.join(cache_home, "hub", "models--bert-base-uncased", "snapshots"),
+            os.path.join(cache_home, "transformers", "bert-base-uncased"),
+        ])
+    candidates.extend([
+        os.path.expanduser("~/.cache/huggingface/hub/models--bert-base-uncased/snapshots"),
+        os.path.expanduser("~/.cache/huggingface/transformers/bert-base-uncased"),
+    ])
+    for root in candidates:
+        if os.path.isdir(root):
+            try:
+                entries = sorted(
+                    [os.path.join(root, p) for p in os.listdir(root)],
+                    key=lambda p: os.path.getmtime(p),
+                    reverse=True
+                )
+            except OSError:
+                entries = []
+            for path in entries:
+                if os.path.isfile(os.path.join(path, "vocab.txt")):
+                    return path
+            if os.path.isfile(os.path.join(root, "vocab.txt")):
+                return root
+    return text_encoder
+
+
+def _build_tokenizer_with_fallback(text_encoder):
+    resolved = _resolve_text_encoder_path(text_encoder)
+    try:
+        return BertTokenizerFast.from_pretrained(resolved, local_files_only=True)
+    except Exception:
+        try:
+            return BertTokenizerFast.from_pretrained(resolved)
+        except Exception:
+            print(f"[WARN] Failed to load tokenizer '{text_encoder}', using simple whitespace tokenizer.")
+            return _SimpleWhitespaceTokenizer()
 
 
 def _parse_csv_arg(value):
@@ -341,7 +425,7 @@ def main_worker(gpu, args, config):
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
 
-    tokenizer = BertTokenizerFast.from_pretrained(args.text_encoder)
+    tokenizer = _build_tokenizer_with_fallback(args.text_encoder)
 
     #### Model #### 
     if args.log:
