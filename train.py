@@ -112,8 +112,16 @@ def _resolve_text_encoder_path(text_encoder):
     return text_encoder
 
 
-def _build_tokenizer_with_fallback(text_encoder):
+def _build_tokenizer_with_fallback(text_encoder, local_files_only=False):
     resolved = _resolve_text_encoder_path(text_encoder)
+    if local_files_only:
+        try:
+            return BertTokenizerFast.from_pretrained(resolved, local_files_only=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Local-only mode enabled, but failed to load tokenizer from '{resolved}'. "
+                f"Please set --text_encoder to a local model directory or ensure HF cache exists."
+            ) from e
     try:
         return BertTokenizerFast.from_pretrained(resolved, local_files_only=True)
     except Exception:
@@ -425,7 +433,7 @@ def main_worker(gpu, args, config):
                                 is_trains=[True, False], 
                                 collate_fns=[None, None])
 
-    tokenizer = _build_tokenizer_with_fallback(args.text_encoder)
+    tokenizer = _build_tokenizer_with_fallback(args.text_encoder, local_files_only=args.local_files_only)
 
     #### Model #### 
     if args.log:
@@ -585,6 +593,8 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=20)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--local_files_only', action='store_true',
+                        help='strictly load tokenizer/model files from local cache/path only')
     parser.add_argument('--data_root', default=None, type=str)
     parser.add_argument('--train_file', default=None, type=str, help='comma-separated json paths')
     parser.add_argument('--val_file', default=None, type=str, help='comma-separated json paths')

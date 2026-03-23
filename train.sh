@@ -20,5 +20,6 @@ python train.py \
 --log_num "${EXPID}" \
 --dist-url "tcp://${HOST}:${DIST_PORT}" \
 --token_momentum \
+--local_files_only \
 --world_size "${NUM_GPU}" \
 --model_save_epoch 100

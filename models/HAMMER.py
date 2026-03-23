@@ -31,7 +31,8 @@ class HAMMER(nn.Module):
             img_size=config['image_res'], patch_size=16, embed_dim=768, depth=12, num_heads=12, 
             mlp_ratio=4, qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6))   
         
-        if init_deit:
+        local_only = bool(getattr(self.args, "local_files_only", False))
+        if init_deit and not local_only:
             try:
                 checkpoint = torch.hub.load_state_dict_from_url(
                     url="https://dl.fbaipublicfiles.com/deit/deit_base_patch16_224-b5f2ef4d.pth",
@@ -108,6 +109,7 @@ class HAMMER(nn.Module):
         self.apply(self._init_weights)
 
     def _build_text_encoder(self, text_encoder, bert_config, label_smoothing):
+        local_only = bool(getattr(self.args, "local_files_only", False))
         # Prefer local cache first for offline robustness.
         try:
             return BertForTokenClassification.from_pretrained(
@@ -116,8 +118,12 @@ class HAMMER(nn.Module):
                 label_smoothing=label_smoothing,
                 local_files_only=True,
             )
-        except Exception:
-            pass
+        except Exception as e_local:
+            if local_only:
+                raise RuntimeError(
+                    f"Failed to load local text encoder weights from '{text_encoder}'. "
+                    f"Please provide a local model path for --text_encoder."
+                ) from e_local
 
         try:
             return BertForTokenClassification.from_pretrained(
@@ -126,12 +132,9 @@ class HAMMER(nn.Module):
                 label_smoothing=label_smoothing,
             )
         except Exception as e:
-            print(f"Warning: failed to load text encoder pretrained weights: {e}")
-            print("Warning: falling back to random text encoder initialization.")
-            return BertForTokenClassification(
-                bert_config,
-                label_smoothing=label_smoothing,
-            )
+            raise RuntimeError(
+                f"Failed to load text encoder pretrained weights from '{text_encoder}'."
+            ) from e
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

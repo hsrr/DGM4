@@ -81,7 +81,9 @@ class _SimpleTokenizerBatch:
         return [None] + list(range(core_len)) + [None]
 
 
-def _build_tokenizer(text_encoder):
+def _build_tokenizer(text_encoder, local_files_only=False):
+    if local_files_only:
+        return BertTokenizerFast.from_pretrained(text_encoder, local_files_only=True)
     try:
         return BertTokenizerFast.from_pretrained(text_encoder, local_files_only=True)
     except Exception:
@@ -317,7 +319,7 @@ def main_worker(gpu, args, config):
 
 
     #### Model #### 
-    tokenizer = _build_tokenizer(args.text_encoder)
+    tokenizer = _build_tokenizer(args.text_encoder, local_files_only=args.local_files_only)
     if args.log:
         print(f"Creating MAMMER")
     model = HAMMER(args=args, config=config, text_encoder=args.text_encoder, tokenizer=tokenizer, init_deit=True)
@@ -410,6 +412,8 @@ if __name__ == '__main__':
     parser.add_argument('--log_num', '-l', type=str)
     parser.add_argument('--model_save_epoch', type=int, default=5)
     parser.add_argument('--token_momentum', default=False, action='store_true')
+    parser.add_argument('--local_files_only', default=False, action='store_true',
+                        help='strictly load pretrained/tokenizer files from local cache/path only')
     parser.add_argument('--test_epoch', default='best', type=str)
     parser.add_argument('--data_root', default=None, type=str)
     parser.add_argument('--train_file', default=None, type=str, help='comma-separated json paths')
