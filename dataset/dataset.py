@@ -2,6 +2,7 @@ from distutils.command.config import config
 import json
 import os
 import random
+import re
 
 from torch.utils.data import Dataset
 import torch
@@ -10,13 +11,34 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS = None
 
-from dataset.utils import pre_caption
 import os
 from torchvision.transforms.functional import hflip, resize
 
 import math
 import random
 from random import random as rand
+
+
+def pre_caption(caption, max_words):
+    caption = re.sub(
+        r"([,.'!?\"()*#:;~])",
+        '',
+        str(caption).lower(),
+    ).replace('-', ' ').replace('/', ' ').replace('<person>', 'person')
+
+    caption = re.sub(
+        r"\s{2,}",
+        ' ',
+        caption,
+    )
+    caption = caption.rstrip('\n')
+    caption = caption.strip(' ')
+
+    caption_words = caption.split(' ')
+    if len(caption_words) > max_words:
+        caption = ' '.join(caption_words[:max_words])
+
+    return caption
 
 
 def _load_annotations_file(path):
