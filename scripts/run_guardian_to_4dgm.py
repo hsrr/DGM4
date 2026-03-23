@@ -110,8 +110,12 @@ def main():
         summary[source] = {
             "AUC_cls": data.get("val_AUC_cls"),
             "ACC_cls": data.get("val_ACC_cls"),
+            "ERR_cls": data.get("val_ERR_cls"),
+            "Binary_F1": data.get("val_Binary_F1"),
             "MAP": data.get("val_MAP"),
+            "ERR_multi": data.get("val_ERR_multi"),
             "CF1": data.get("val_CF1"),
+            "OC1": data.get("val_OC1"),
         }
 
     out_dir = os.path.join(args.output_dir, args.exp_id, "evaluation")
@@ -126,8 +130,12 @@ def main():
             f"{source:16s} "
             f"AUC={metrics['AUC_cls']} "
             f"ACC={metrics['ACC_cls']} "
+            f"ERR={metrics['ERR_cls']} "
+            f"BinaryF1={metrics['Binary_F1']} "
             f"mAP={metrics['MAP']} "
-            f"CF1={metrics['CF1']}"
+            f"multiERR={metrics['ERR_multi']} "
+            f"CF1={metrics['CF1']} "
+            f"OC1={metrics['OC1']}"
         )
     print(f"\nSaved summary to: {out_path}")
 

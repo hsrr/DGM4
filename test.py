@@ -35,7 +35,7 @@ from types import MethodType
 from tools.env import init_dist
 from tqdm import tqdm
 
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import f1_score, roc_auc_score
 from tools.multilabel_metrics import AveragePrecisionMeter, get_multi_label
 
 from models.HAMMER import HAMMER
@@ -83,6 +83,34 @@ def safe_barrier():
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
+def _safe_multilabel_metrics(meter):
+    if meter.scores.numel() == 0:
+        return float('nan'), float('nan'), float('nan')
+    map_tensor = meter.value()
+    map_score = map_tensor.mean().item() if torch.is_tensor(map_tensor) else float(map_tensor)
+    overall = meter.overall()
+    if isinstance(overall, tuple):
+        _, _, of1, _, _, cf1 = overall
+    else:
+        of1 = float('nan')
+        cf1 = float('nan')
+    return map_score, cf1, of1
+
+
+def _safe_binary_metrics(y_true, y_score, y_pred_label):
+    if y_true.size == 0:
+        return float('nan'), float('nan'), float('nan'), float('nan')
+
+    try:
+        auc = roc_auc_score(y_true, y_score)
+    except ValueError:
+        auc = float('nan')
+
+    acc = float(np.mean(y_pred_label == y_true))
+    err = 1.0 - acc
+    f1 = f1_score(y_true, y_pred_label, zero_division=0)
+    return auc, acc, err, f1
+
 
 def text_input_adjust(text_input, fake_word_pos, device):
     # input_ids adaptation
@@ -127,12 +155,12 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
     print('Computing features for evaluation...')
     print_freq = 200 
 
-    y_true, y_pred = [], []
-    cls_nums_all = 0
-    cls_acc_all = 0   
+    y_true, y_pred, y_pred_label = [], [], []
 
     multi_label_meter = AveragePrecisionMeter(difficult_examples=False)
     multi_label_meter.reset()
+    multi_nums_all = 0
+    multi_exact_correct_all = 0
 
     for i, (image, label, text, fake_image_box, fake_word_pos, W, H) in enumerate(metric_logger.log_every(args, data_loader, print_freq, header)):
         
@@ -153,26 +181,35 @@ def evaluation(args, model, data_loader, tokenizer, device, config):
         y_true.extend(cls_label.cpu().flatten().tolist())
 
         pred_acc = logits_real_fake.argmax(1)
-        cls_nums_all += cls_label.shape[0]
-        cls_acc_all += torch.sum(pred_acc == cls_label).item()
+        y_pred_label.extend(pred_acc.cpu().flatten().tolist())
 
         # ----- multi metrics -----
         target, _ = get_multi_label(label, image)
         multi_label_meter.add(logits_multicls, target)
+        pred_multi = (torch.sigmoid(logits_multicls) >= 0.5).long()
+        multi_nums_all += target.shape[0]
+        multi_exact_correct_all += torch.sum(torch.all(pred_multi == target, dim=1)).item()
         
         
     ##================= real/fake cls ========================## 
-    y_true, y_pred = np.array(y_true), np.array(y_pred)
-    try:
-        AUC_cls = roc_auc_score(y_true, y_pred)
-    except ValueError:
-        AUC_cls = float('nan')
-    ACC_cls = cls_acc_all / cls_nums_all
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    y_pred_label = np.array(y_pred_label)
+    AUC_cls, ACC_cls, ERR_cls, BINARY_F1 = _safe_binary_metrics(y_true, y_pred, y_pred_label)
     ##================= multi-label cls ========================## 
-    MAP = multi_label_meter.value().mean()
-    OP, OR, OF1, CP, CR, CF1 = multi_label_meter.overall()
+    MAP, CF1, OC1 = _safe_multilabel_metrics(multi_label_meter)
+    ERR_multi = 1.0 - (multi_exact_correct_all / multi_nums_all) if multi_nums_all > 0 else float('nan')
 
-    return AUC_cls, ACC_cls, MAP.item(), CF1
+    return {
+        "AUC_cls": AUC_cls,
+        "ACC_cls": ACC_cls,
+        "ERR_cls": ERR_cls,
+        "Binary_F1": BINARY_F1,
+        "MAP": MAP,
+        "ERR_multi": ERR_multi,
+        "CF1": CF1,
+        "OC1": OC1,
+    }
     
 def main_worker(gpu, args, config):
 
@@ -258,12 +295,16 @@ def main_worker(gpu, args, config):
     if args.log:
         print("Start evaluation")
 
-    AUC_cls, ACC_cls, MAP, CF1 = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
+    metrics = evaluation(args, model_without_ddp, val_loader, tokenizer, device, config)
     #============ evaluation info ============#
-    val_stats = {"AUC_cls": "{:.4f}".format(AUC_cls*100),
-                    "ACC_cls": "{:.4f}".format(ACC_cls*100),
-                    "MAP": "{:.4f}".format(MAP*100),
-                    "CF1": "{:.4f}".format(CF1*100),
+    val_stats = {"AUC_cls": "{:.4f}".format(metrics["AUC_cls"]*100),
+                    "ACC_cls": "{:.4f}".format(metrics["ACC_cls"]*100),
+                    "ERR_cls": "{:.4f}".format(metrics["ERR_cls"]*100),
+                    "Binary_F1": "{:.4f}".format(metrics["Binary_F1"]*100),
+                    "MAP": "{:.4f}".format(metrics["MAP"]*100),
+                    "ERR_multi": "{:.4f}".format(metrics["ERR_multi"]*100),
+                    "CF1": "{:.4f}".format(metrics["CF1"]*100),
+                    "OC1": "{:.4f}".format(metrics["OC1"]*100),
     }
     
     if utils.is_main_process(): 
